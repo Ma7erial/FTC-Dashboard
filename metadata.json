@@ -1,0 +1,7 @@
+{
+  "name": "FTC Club Nexus",
+  "description": "A comprehensive management platform for FTC robotics clubs, featuring team coordination, attendance insights, task delegation, budgeting, and AI-powered news scouting.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
