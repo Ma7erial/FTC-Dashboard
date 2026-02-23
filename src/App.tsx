@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
   LayoutDashboard, 
   Users, 
@@ -18,10 +18,20 @@ import {
   Award,
   MessageSquare,
   Send,
+  Bell,
   LogOut,
   Lock,
   UserPlus,
-  Search
+  Search,
+  EyeOff,
+  Eye,
+  Edit2,
+  Calendar,
+  User,
+  Zap,
+  Trash2,
+  Camera,
+  FileText
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
@@ -31,10 +41,11 @@ import {
   BarChart, Bar, Cell, PieChart, Pie
 } from 'recharts';
 import Markdown from 'react-markdown';
+import { GoogleGenAI, Type } from "@google/genai";
 import { format } from 'date-fns';
 
 import { Team, Member, AttendanceRecord, Task, BudgetItem, OutreachEvent, Communication } from './types';
-import { fetchFTCNews, getAttendanceInsights, checkExcuse } from './services/geminiService';
+import { fetchFTCNews, getAttendanceInsights, checkExcuse, getActivitySummary } from './services/geminiService';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -107,7 +118,8 @@ const Select = ({ className, options, ...props }: any) => (
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
-  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(window.innerWidth > 768);
+  const [showNotifications, setShowNotifications] = useState(false);
   
   // Auth State
   const [currentUser, setCurrentUser] = useState<Member | null>(null);
@@ -124,10 +136,14 @@ export default function App() {
   const [budget, setBudget] = useState<BudgetItem[]>([]);
   const [outreach, setOutreach] = useState<OutreachEvent[]>([]);
   const [communications, setCommunications] = useState<Communication[]>([]);
+  const [documentation, setDocumentation] = useState<any[]>([]);
   const [messages, setMessages] = useState<any[]>([]);
+  const [notifications, setNotifications] = useState<any[]>([]);
+  const [hiddenDates, setHiddenDates] = useState<string[]>([]);
   const [settings, setSettings] = useState<any>({});
   const [news, setNews] = useState<string>("");
   const [insights, setInsights] = useState<string>("");
+  const [summary, setSummary] = useState<string>("");
   const [loading, setLoading] = useState(false);
 
   // WebSocket
@@ -144,45 +160,107 @@ export default function App() {
   const connectSocket = () => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${protocol}//${window.location.host}`);
+    
+    ws.onopen = () => {
+      console.log("WebSocket connected");
+    };
+
     ws.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
-      if (msg.type === 'chat') {
-        setMessages(prev => [...prev, msg]);
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'chat') {
+          setMessages(prev => [...prev, msg]);
+        } else if (msg.type === 'notification') {
+          if (currentUser && msg.notification.user_id === currentUser.id) {
+            setNotifications(prev => [msg.notification, ...prev]);
+          }
+        }
+      } catch (err) {
+        console.error("WS Message Error:", err);
       }
     };
+
+    ws.onclose = () => {
+      console.log("WebSocket disconnected, retrying in 3s...");
+      setTimeout(connectSocket, 3000);
+    };
+
+    ws.onerror = (err) => {
+      console.error("WebSocket error:", err);
+      ws.close();
+    };
+
     setSocket(ws);
   };
 
   const fetchData = async () => {
-    // Parallel fetch for speed
+    setLoading(true);
     try {
-      const [t, m, a, tk, b, o, c, msgs, s] = await Promise.all([
-        fetch('/api/teams').then(res => res.json()),
-        fetch('/api/members').then(res => res.json()),
-        fetch('/api/attendance').then(res => res.json()),
-        fetch('/api/tasks').then(res => res.json()),
-        fetch('/api/budget').then(res => res.json()),
-        fetch('/api/outreach').then(res => res.json()),
-        fetch('/api/communications').then(res => res.json()),
-        fetch('/api/messages').then(res => res.json()),
-        fetch('/api/settings').then(res => res.json()),
-      ]);
-      setTeams(t);
-      setMembers(m);
-      setAttendance(a);
-      setTasks(tk);
-      setBudget(b);
-      setOutreach(o);
-      setCommunications(c);
-      setMessages(msgs);
-      const settingsMap = s.reduce((acc: any, curr: any) => ({ ...acc, [curr.key]: curr.value }), {});
-      setSettings(settingsMap);
+      const fetchJson = async (url: string) => {
+        const res = await fetch(url);
+        if (!res.ok) {
+          console.warn(`Fetch failed for ${url}: ${res.status}`);
+          return null;
+        }
+        try {
+          return await res.json();
+        } catch (e) {
+          console.warn(`Failed to parse JSON for ${url}`);
+          return null;
+        }
+      };
 
-      // Background fetches
-      fetchFTCNews().then(setNews);
-      if (a.length > 0) getAttendanceInsights(a, m).then(setInsights);
+      const [t, m, a, tk, b, o, c, msgs, s, h, d] = await Promise.all([
+        fetchJson('/api/teams'),
+        fetchJson('/api/members'),
+        fetchJson('/api/attendance'),
+        fetchJson('/api/tasks'),
+        fetchJson('/api/budget'),
+        fetchJson('/api/outreach'),
+        fetchJson('/api/communications'),
+        fetchJson('/api/messages'),
+        fetchJson('/api/settings'),
+        fetchJson('/api/hidden-dates'),
+        fetchJson('/api/documentation'),
+      ]);
+
+      if (Array.isArray(t)) setTeams(t);
+      if (Array.isArray(m)) setMembers(m);
+      if (Array.isArray(a)) setAttendance(a);
+      if (Array.isArray(tk)) setTasks(tk);
+      if (Array.isArray(b)) setBudget(b);
+      if (Array.isArray(o)) setOutreach(o);
+      if (Array.isArray(c)) setCommunications(c);
+      if (Array.isArray(msgs)) setMessages(msgs);
+      if (Array.isArray(h)) setHiddenDates(h);
+      if (Array.isArray(d)) setDocumentation(d);
+      if (s && Array.isArray(s)) {
+        const settingsMap = s.reduce((acc: any, curr: any) => ({ ...acc, [curr.key]: curr.value }), {});
+        setSettings(settingsMap);
+      }
+
+      if (currentUser) {
+        const notes = await fetchJson(`/api/notifications/${currentUser.id}`);
+        if (Array.isArray(notes)) setNotifications(notes);
+      }
+
+      // Background updates
+      fetchFTCNews().then(res => res && setNews(res));
+      if (a && a.length > 0 && m) {
+        getAttendanceInsights(a, m).then(res => res && setInsights(res));
+      }
+      if (currentUser) {
+        getActivitySummary({ 
+          tasks: tk, 
+          messages: msgs, 
+          budget: b,
+          userScope: { role: currentUser.role, is_board: currentUser.is_board, scopes: currentUser.scopes }
+        }).then(res => res && setSummary(res));
+      }
     } catch (err) {
-      console.error(err);
+      console.error("Error in fetchData:", err);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -240,11 +318,30 @@ export default function App() {
     }
   };
 
+  const handleLogout = () => {
+    setIsLoggedIn(false);
+    setCurrentUser(null);
+    setSocket(null);
+  };
+
+  const markNotificationsRead = async () => {
+    const unreadIds = notifications.filter(n => !n.is_read).map(n => n.id);
+    if (unreadIds.length === 0) return;
+    
+    await fetch('/api/notifications/read', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: unreadIds })
+    });
+    setNotifications(prev => prev.map(n => ({ ...n, is_read: 1 })));
+  };
+
   const hasScope = (scope: string) => {
     if (!currentUser) return false;
     if (currentUser.role === 'President') return true;
+    if (scope === 'admin' && currentUser.is_board) return true;
     try {
-      const scopes = JSON.parse(currentUser.scopes);
+      const scopes = typeof currentUser.scopes === 'string' ? JSON.parse(currentUser.scopes) : currentUser.scopes;
       return scopes.includes(scope);
     } catch {
       return false;
@@ -265,17 +362,22 @@ export default function App() {
   ];
 
   const renderContent = () => {
+    const viewProps = {
+      teams, members, attendance, tasks, budget, outreach, communications, 
+      messages, settings, hiddenDates, currentUser, onRefresh: fetchData, setLoading,
+      insights, news, summary, socket
+    };
     switch (activeTab) {
-      case 'dashboard': return <DashboardView data={{ teams, members, attendance, tasks, budget, outreach, insights }} currentUser={currentUser} onRefresh={fetchData} settings={settings} setLoading={setLoading} />;
-      case 'teams': return <TeamsView teams={teams} members={members} onRefresh={fetchData} currentUser={currentUser} />;
-      case 'attendance': return <AttendanceView members={members} attendance={attendance} onRefresh={fetchData} />;
-      case 'tasks': return <TasksView tasks={tasks} teams={teams} members={members} onRefresh={fetchData} currentUser={currentUser} />;
-      case 'budget': return <BudgetView budget={budget} teams={teams} onRefresh={fetchData} />;
-      case 'outreach': return <OutreachView events={outreach} onRefresh={fetchData} />;
-      case 'comm': return <CommunicationView communications={communications} onRefresh={fetchData} />;
-      case 'chat': return <ChatView messages={messages} members={members} currentUser={currentUser} socket={socket} />;
-      case 'scout': return <ScoutView news={news} onRefresh={fetchData} />;
-      case 'settings': return <SettingsView settings={settings} onRefresh={fetchData} />;
+      case 'dashboard': return <DashboardView {...viewProps} data={{ attendance, tasks, budget, outreach, insights, news, summary }} />;
+      case 'teams': return <TeamsView {...viewProps} />;
+      case 'attendance': return <AttendanceView {...viewProps} />;
+      case 'tasks': return <TasksView {...viewProps} />;
+      case 'budget': return <BudgetView {...viewProps} />;
+      case 'outreach': return <OutreachView {...viewProps} />;
+      case 'comm': return <CommunicationView {...viewProps} />;
+      case 'chat': return <ChatView {...viewProps} />;
+      case 'scout': return <ScoutView {...viewProps} />;
+      case 'settings': return <SettingsView {...viewProps} />;
       default: return null;
     }
   };
@@ -317,12 +419,31 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-screen overflow-hidden">
+    <div className="flex h-screen overflow-hidden bg-primary">
+      {/* Sidebar Overlay for Mobile */}
+      <AnimatePresence>
+        {isSidebarOpen && window.innerWidth <= 768 && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setIsSidebarOpen(false)}
+            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-30"
+          />
+        )}
+      </AnimatePresence>
+
       {/* Sidebar */}
       <motion.aside 
         initial={false}
-        animate={{ width: isSidebarOpen ? 280 : 80 }}
-        className="bg-secondary border-r border-white/5 flex flex-col z-20"
+        animate={{ 
+          width: isSidebarOpen ? 280 : 80,
+          x: (window.innerWidth <= 768 && !isSidebarOpen) ? -280 : 0
+        }}
+        className={cn(
+          "bg-secondary border-r border-white/5 flex flex-col z-40 transition-all duration-300",
+          window.innerWidth <= 768 ? "fixed inset-y-0 left-0" : "relative"
+        )}
       >
         <div className="p-6 flex items-center gap-3">
           <div className="w-10 h-10 bg-accent rounded-xl flex items-center justify-center gold-glow">
@@ -361,6 +482,17 @@ export default function App() {
         </nav>
 
         <div className="p-4 border-t border-white/5">
+          <div className="flex items-center gap-3 p-3 mb-2">
+            <div className="w-8 h-8 rounded-full bg-accent flex items-center justify-center text-primary font-bold text-xs">
+              {currentUser?.name.charAt(0)}
+            </div>
+            {isSidebarOpen && (
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-bold text-white truncate">{currentUser?.name}</p>
+                <button onClick={handleLogout} className="text-[10px] text-rose-400 hover:underline">Logout</button>
+              </div>
+            )}
+          </div>
           <button 
             onClick={() => setIsSidebarOpen(!isSidebarOpen)}
             className="w-full flex items-center gap-3 p-3 text-slate-400 hover:text-white"
@@ -372,10 +504,62 @@ export default function App() {
       </motion.aside>
 
       {/* Main Content */}
-      <main className="flex-1 overflow-y-auto bg-primary custom-scrollbar">
-        <header className="sticky top-0 z-10 glass px-8 py-4 flex items-center justify-between">
-          <h2 className="text-2xl font-display font-bold text-white capitalize">{activeTab.replace('-', ' ')}</h2>
+      <main className="flex-1 overflow-y-auto bg-primary custom-scrollbar relative">
+        <header className="sticky top-0 z-20 glass px-4 sm:px-8 py-4 flex items-center justify-between">
           <div className="flex items-center gap-4">
+            <button 
+              onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+              className="p-2 text-slate-400 hover:text-white sm:hidden"
+            >
+              <Menu className="w-6 h-6" />
+            </button>
+            <h2 className="text-xl sm:text-2xl font-display font-bold text-white capitalize">{activeTab.replace('-', ' ')}</h2>
+          </div>
+          
+          <div className="flex items-center gap-2 sm:gap-4">
+            <div className="relative">
+              <button 
+                onClick={() => {
+                  setShowNotifications(!showNotifications);
+                  if (!showNotifications) markNotificationsRead();
+                }}
+                className="relative p-2 text-slate-400 hover:text-white transition-colors"
+              >
+                <Bell className="w-5 h-5" />
+                {notifications.some(n => !n.is_read) && (
+                  <span className="absolute top-1.5 right-1.5 w-2 h-2 bg-accent rounded-full border-2 border-primary" />
+                )}
+              </button>
+
+              <AnimatePresence>
+                {showNotifications && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 10 }}
+                    className="absolute right-0 mt-2 w-80 glass rounded-2xl border border-white/10 shadow-2xl overflow-hidden z-50"
+                  >
+                    <div className="p-4 border-b border-white/10 bg-white/5">
+                      <h4 className="text-sm font-bold text-white">Notifications</h4>
+                    </div>
+                    <div className="max-h-96 overflow-y-auto custom-scrollbar">
+                      {notifications.length > 0 ? (
+                        notifications.map(n => (
+                          <div key={n.id} className={cn("p-4 border-b border-white/5 hover:bg-white/5 transition-colors", !n.is_read && "bg-accent/5")}>
+                            <p className="text-xs text-white leading-relaxed">{n.content}</p>
+                            <p className="text-[10px] text-slate-500 mt-1">{format(new Date(n.timestamp), 'MMM d, h:mm a')}</p>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="p-8 text-center">
+                          <p className="text-xs text-slate-500">No notifications yet</p>
+                        </div>
+                      )}
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
             {currentUser && (
               <div className="flex items-center gap-3 px-4 py-2 bg-white/5 rounded-full border border-white/10">
                 <div className="w-8 h-8 rounded-full bg-accent flex items-center justify-center text-primary font-bold text-xs">
@@ -385,6 +569,9 @@ export default function App() {
                   <p className="text-xs font-bold text-white">{currentUser.name}</p>
                   <p className="text-[10px] text-slate-400">{currentUser.role}</p>
                 </div>
+                <button onClick={handleLogout} className="ml-2 p-1 text-slate-500 hover:text-rose-400 transition-colors">
+                  <LogOut className="w-4 h-4" />
+                </button>
               </div>
             )}
           </div>
@@ -419,6 +606,9 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: a
   const [showOut, setShowOut] = useState(false);
   const [outReason, setOutReason] = useState('');
 
+  const today = format(new Date(), 'yyyy-MM-dd');
+  const myStatus = data.attendance.find((r: any) => r.member_id === currentUser.id && r.date === today);
+
   const handleImOut = async () => {
     setLoading(true);
     try {
@@ -448,30 +638,30 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: a
   );
 
   const attendanceRate = data.attendance.length > 0 
-    ? (data.attendance.filter((r: any) => r.status === 'present').length / data.attendance.length * 100).toFixed(1)
+    ? (data.attendance.filter((r: any) => r.status === 'P').length / data.attendance.length * 100).toFixed(1)
     : 0;
 
   const activeTasks = data.tasks.filter((t: any) => t.status !== 'done').length;
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-      <Card title="Club Health" icon={TrendingUp} className="md:col-span-2">
-        <div className="grid grid-cols-3 gap-4">
+    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 pb-20">
+      <Card title="Club Health" icon={TrendingUp} className="lg:col-span-2">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div className="p-4 bg-white/5 rounded-2xl border border-white/5">
             <p className="text-xs text-slate-400 uppercase font-bold mb-1">Attendance</p>
-            <p className="text-3xl font-display font-bold text-accent">{attendanceRate}%</p>
+            <p className="text-2xl sm:text-3xl font-display font-bold text-accent">{attendanceRate}%</p>
           </div>
           <div className="p-4 bg-white/5 rounded-2xl border border-white/5">
             <p className="text-xs text-slate-400 uppercase font-bold mb-1">Budget</p>
-            <p className="text-3xl font-display font-bold text-emerald-400">${totalBudget.toLocaleString()}</p>
+            <p className="text-2xl sm:text-3xl font-display font-bold text-emerald-400 truncate">${totalBudget.toLocaleString()}</p>
           </div>
           <div className="p-4 bg-white/5 rounded-2xl border border-white/5">
             <p className="text-xs text-slate-400 uppercase font-bold mb-1">Active Tasks</p>
-            <p className="text-3xl font-display font-bold text-blue-400">{activeTasks}</p>
+            <p className="text-2xl sm:text-3xl font-display font-bold text-blue-400">{activeTasks}</p>
           </div>
         </div>
         
-        <div className="mt-6 h-64">
+        <div className="mt-6 h-64 min-h-[250px]">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={data.attendance.slice(-10)}>
               <CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" />
@@ -487,17 +677,47 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: a
         </div>
       </Card>
 
-      <Card title="AI Insights" icon={Clock}>
-        <div className="text-sm text-slate-300 leading-relaxed prose prose-invert max-h-[400px] overflow-y-auto custom-scrollbar">
+      <Card title="AI Insights" icon={Clock} className="h-full">
+        <div className="text-sm text-slate-300 leading-relaxed prose prose-invert h-[300px] lg:h-[400px] overflow-y-auto custom-scrollbar pr-2">
           <Markdown>{data.insights || "Analyzing club data for insights..."}</Markdown>
+        </div>
+      </Card>
+
+      <Card title="Personal Status" icon={User} className="md:col-span-1">
+        <div className="space-y-4">
+          {myStatus ? (
+            <div className={cn(
+              "p-4 rounded-xl border flex flex-col gap-2",
+              myStatus.status === 'P' ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400" :
+              myStatus.status === 'A' ? "bg-rose-500/10 border-rose-500/30 text-rose-400" :
+              "bg-amber-500/10 border-amber-500/30 text-amber-400"
+            )}>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <CalendarCheck className="w-4 h-4" />
+                  <span className="text-sm font-bold">Today: {
+                    myStatus.status === 'P' ? 'Present' : 
+                    myStatus.status === 'A' ? 'Absent' : 
+                    myStatus.status === 'E' ? 'Excused' : 'Late'
+                  }</span>
+                </div>
+                {myStatus.reason && <p className="text-[10px] opacity-70">Reason logged</p>}
+              </div>
+              {myStatus.reason && <p className="text-xs italic opacity-80">"{myStatus.reason}"</p>}
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <p className="text-xs text-slate-400">You haven't been marked for today yet.</p>
+              <Button onClick={() => setShowOut(true)} variant="outline" className="w-full border-rose-500/50 text-rose-400 hover:bg-rose-500/10">
+                <LogOut className="w-4 h-4" /> I'm Out Today
+              </Button>
+            </div>
+          )}
         </div>
       </Card>
 
       <Card title="Upcoming Tasks" className="md:col-span-1">
         <div className="space-y-3">
-          <Button onClick={() => setShowOut(true)} variant="outline" className="w-full border-rose-500/50 text-rose-400 hover:bg-rose-500/10">
-            <LogOut className="w-4 h-4" /> I'm Out Today
-          </Button>
           {data.tasks.filter((t: any) => t.status !== 'done').slice(0, 5).map((task: any) => (
             <div key={task.id} className="p-3 bg-white/5 rounded-xl border border-white/5 flex items-center justify-between">
               <div>
@@ -513,24 +733,9 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: a
         </div>
       </Card>
 
-      <Card title="Recent Outreach" className="md:col-span-2">
-        <div className="space-y-4">
-          {data.outreach.slice(0, 3).map((event: any) => (
-            <div key={event.id} className="flex items-start gap-4 p-4 bg-white/5 rounded-2xl border border-white/5">
-              <div className="w-12 h-12 bg-accent/20 rounded-xl flex items-center justify-center text-accent">
-                <Globe className="w-6 h-6" />
-              </div>
-              <div>
-                <h4 className="text-white font-bold">{event.title}</h4>
-                <p className="text-xs text-slate-400">{event.location} • {event.date}</p>
-                <p className="text-sm text-slate-300 mt-1">{event.description}</p>
-              </div>
-              <div className="ml-auto text-right">
-                <p className="text-xl font-display font-bold text-accent">{event.hours}h</p>
-                <p className="text-[10px] text-slate-400 uppercase font-bold">Logged</p>
-              </div>
-            </div>
-          ))}
+      <Card title="AI Activity Summary" icon={Zap} className="md:col-span-2">
+        <div className="text-sm text-slate-300 leading-relaxed prose prose-invert max-h-[400px] overflow-y-auto custom-scrollbar pr-2">
+          <Markdown>{data.summary || "Generating activity summary..."}</Markdown>
         </div>
       </Card>
 
@@ -560,6 +765,7 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: a
 function TeamsView({ teams, members, onRefresh, currentUser }: any) {
   const [showAddTeam, setShowAddTeam] = useState(false);
   const [showAddMember, setShowAddMember] = useState(false);
+  const [editingTeam, setEditingTeam] = useState<any>(null);
   const [newTeam, setNewTeam] = useState({ name: '', number: '' });
   const [newMember, setNewMember] = useState({ team_id: '', name: '', role: '', email: '', is_board: false, scopes: [] });
 
@@ -576,12 +782,28 @@ function TeamsView({ teams, members, onRefresh, currentUser }: any) {
   };
 
   const handleAddTeam = async () => {
-    await fetch('/api/teams', {
-      method: 'POST',
+    const url = editingTeam ? `/api/teams/${editingTeam.id}` : '/api/teams';
+    const method = editingTeam ? 'PATCH' : 'POST';
+    await fetch(url, {
+      method,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newTeam)
     });
     setShowAddTeam(false);
+    setEditingTeam(null);
+    setNewTeam({ name: '', number: '' });
+    onRefresh();
+  };
+
+  const handleDeleteTeam = async (id: number) => {
+    if (!confirm("Are you sure? This will delete the team.")) return;
+    await fetch(`/api/teams/${id}`, { method: 'DELETE' });
+    onRefresh();
+  };
+
+  const handleDeleteMember = async (id: number) => {
+    if (!confirm("Are you sure? This will delete the member.")) return;
+    await fetch(`/api/members/${id}`, { method: 'DELETE' });
     onRefresh();
   };
 
@@ -605,15 +827,41 @@ function TeamsView({ teams, members, onRefresh, currentUser }: any) {
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {teams.map((team: any) => (
           <Card key={team.id} title={`${team.name} #${team.number}`} icon={Award}>
-            <div className="space-y-2">
-              <p className="text-xs text-slate-400 uppercase font-bold">Members</p>
-              <div className="flex flex-wrap gap-2">
-                {members.filter((m: any) => m.team_id === team.id).map((m: any) => (
-                  <div key={m.id} className="px-3 py-1 bg-white/5 rounded-full border border-white/10 text-xs text-white">
-                    {m.name}
-                  </div>
-                ))}
+            <div className="flex flex-col h-full">
+              <div className="flex-1 space-y-2 mb-4">
+                <p className="text-xs text-slate-400 uppercase font-bold">Members</p>
+                <div className="flex flex-wrap gap-2">
+                  {members.filter((m: any) => m.team_id === team.id).map((m: any) => (
+                    <div key={m.id} className="px-3 py-1 bg-white/5 rounded-full border border-white/10 text-xs text-white">
+                      {m.name}
+                    </div>
+                  ))}
+                </div>
               </div>
+              {isAdmin && (
+                <div className="flex gap-2 pt-4 border-t border-white/5">
+                  <Button 
+                    variant="secondary" 
+                    size="sm" 
+                    className="flex-1 h-8 text-[10px]"
+                    onClick={() => {
+                      setEditingTeam(team);
+                      setNewTeam({ name: team.name, number: team.number });
+                      setShowAddTeam(true);
+                    }}
+                  >
+                    <Edit2 className="w-3 h-3 mr-1" /> Edit
+                  </Button>
+                  <Button 
+                    variant="outline" 
+                    size="sm" 
+                    className="h-8 w-8 p-0 border-rose-500/30 text-rose-400 hover:bg-rose-500/10"
+                    onClick={() => handleDeleteTeam(team.id)}
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </Button>
+                </div>
+              )}
             </div>
           </Card>
         ))}
@@ -653,15 +901,26 @@ function TeamsView({ teams, members, onRefresh, currentUser }: any) {
                   {JSON.parse(m.scopes).join(', ') || 'None'}
                 </td>
                 <td className="px-6 py-4 text-right">
-                  {isAdmin && (
-                    <button 
-                      onClick={() => handleResetPassword(m.email)}
-                      className="p-2 text-slate-500 hover:text-accent transition-colors"
-                      title="Reset Password"
-                    >
-                      <Lock className="w-4 h-4" />
-                    </button>
-                  )}
+                  <div className="flex justify-end gap-2">
+                    {isAdmin && (
+                      <button 
+                        onClick={() => handleResetPassword(m.email)}
+                        className="p-2 text-slate-500 hover:text-accent transition-colors"
+                        title="Reset Password"
+                      >
+                        <Lock className="w-4 h-4" />
+                      </button>
+                    )}
+                    {isAdmin && (
+                      <button 
+                        onClick={() => handleDeleteMember(m.id)}
+                        className="p-2 text-slate-500 hover:text-rose-400 transition-colors"
+                        title="Delete Member"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
                 </td>
               </tr>
             ))}
@@ -672,13 +931,13 @@ function TeamsView({ teams, members, onRefresh, currentUser }: any) {
       {/* Modals (Simplified) */}
       {showAddTeam && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-          <Card title="Add New Team" className="w-full max-w-md">
+          <Card title={editingTeam ? "Edit Team" : "Add New Team"} className="w-full max-w-md">
             <div className="space-y-4">
               <Input placeholder="Team Name (e.g. CyberKnights)" value={newTeam.name} onChange={(e: any) => setNewTeam({...newTeam, name: e.target.value})} />
               <Input placeholder="Team Number (e.g. 12345)" value={newTeam.number} onChange={(e: any) => setNewTeam({...newTeam, number: e.target.value})} />
               <div className="flex gap-3 justify-end">
-                <Button variant="secondary" onClick={() => setShowAddTeam(false)}>Cancel</Button>
-                <Button onClick={handleAddTeam}>Create Team</Button>
+                <Button variant="secondary" onClick={() => { setShowAddTeam(false); setEditingTeam(null); setNewTeam({ name: '', number: '' }); }}>Cancel</Button>
+                <Button onClick={handleAddTeam}>{editingTeam ? "Save Changes" : "Create Team"}</Button>
               </div>
             </div>
           </Card>
@@ -740,138 +999,125 @@ function TeamsView({ teams, members, onRefresh, currentUser }: any) {
   );
 }
 
-function AttendanceView({ members, attendance, onRefresh }: any) {
+function AttendanceView({ members, attendance, onRefresh, setLoading }: any) {
   const [selectedDate, setSelectedDate] = useState(format(new Date(), 'yyyy-MM-dd'));
-  const [search, setSearch] = useState('');
-  const [highlightedIndex, setHighlightedIndex] = useState(0);
 
-  const filteredMembers = members.filter((m: any) => 
-    m.name.toLowerCase().includes(search.toLowerCase())
-  );
+  const getStatus = (memberId: number) => {
+    return attendance.find((r: any) => r.member_id === memberId && r.date === selectedDate)?.status || '-';
+  };
 
-  const handleQuickMark = async (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && filteredMembers.length > 0) {
-      const target = filteredMembers[highlightedIndex];
-      const records = members.map((m: any) => ({
-        member_id: m.id,
-        status: m.id === target.id ? 'A' : 'P',
-        reason: m.id === target.id ? 'Marked absent via quick-log' : null
-      }));
-      
+  const setStatus = async (memberId: number, status: string) => {
+    setLoading(true);
+    try {
+      await fetch('/api/attendance/batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          date: selectedDate, 
+          records: [{ member_id: memberId, status: status === '-' ? null : status }] 
+        })
+      });
+      onRefresh();
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const markAll = async (status: string) => {
+    setLoading(true);
+    try {
+      const records = members.map((m: any) => ({ member_id: m.id, status }));
       await fetch('/api/attendance/batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ date: selectedDate, records })
       });
-      setSearch('');
       onRefresh();
-    }
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      setHighlightedIndex(prev => Math.min(prev + 1, filteredMembers.length - 1));
-    }
-    if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      setHighlightedIndex(prev => Math.max(prev - 1, 0));
+    } finally {
+      setLoading(false);
     }
   };
-
-  const cycleStatus = async (memberId: number, date: string) => {
-    const current = getStatus(memberId, date);
-    const statuses = ['-', 'P', 'A', 'L', 'E', 'U', 'S'];
-    const nextIndex = (statuses.indexOf(current) + 1) % statuses.length;
-    const nextStatus = statuses[nextIndex];
-
-    await fetch('/api/attendance/batch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        date, 
-        records: [{ member_id: memberId, status: nextStatus === '-' ? null : nextStatus }] 
-      })
-    });
-    onRefresh();
-  };
-
-  const getStatus = (memberId: number, date: string) => {
-    return attendance.find((r: any) => r.member_id === memberId && r.date === date)?.status || '-';
-  };
-
-  const dates = Array.from({ length: 14 }).map((_, i) => {
-    const d = new Date();
-    d.setDate(d.getDate() - i);
-    return format(d, 'yyyy-MM-dd');
-  }).reverse();
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col md:flex-row gap-4 items-center justify-between">
-        <div className="relative w-full max-w-md">
-          <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
-          <Input 
-            placeholder="Type name and hit Enter to mark ABSENT (others present)..." 
-            className="pl-10"
-            value={search}
-            onChange={(e: any) => { setSearch(e.target.value); setHighlightedIndex(0); }}
-            onKeyDown={handleQuickMark}
-          />
-          {search && (
-            <div className="absolute top-full left-0 w-full glass mt-2 rounded-xl overflow-hidden z-30 border border-white/10">
-              {filteredMembers.slice(0, 5).map((m: any, i: number) => (
-                <div key={m.id} className={cn("px-4 py-2 text-sm", i === highlightedIndex ? "bg-accent text-primary font-bold" : "text-slate-300")}>
-                  {m.name}
-                </div>
-              ))}
-            </div>
-          )}
+      <div className="flex flex-col sm:flex-row gap-4 items-center justify-between glass p-6 rounded-2xl border border-white/10">
+        <div className="flex items-center gap-4">
+          <div className="p-3 bg-accent/20 rounded-xl text-accent">
+            <Calendar className="w-6 h-6" />
+          </div>
+          <div>
+            <h3 className="text-lg font-display font-bold text-white">Daily Attendance</h3>
+            <p className="text-xs text-slate-400">Mark who's here for the session</p>
+          </div>
         </div>
-        <Input type="date" className="w-48" value={selectedDate} onChange={(e: any) => setSelectedDate(e.target.value)} />
+        <div className="flex items-center gap-3">
+          <Input 
+            type="date" 
+            className="w-48" 
+            value={selectedDate} 
+            onChange={(e: any) => setSelectedDate(e.target.value)} 
+          />
+          <div className="flex gap-2">
+            <Button size="sm" variant="secondary" onClick={() => markAll('P')}>All Present</Button>
+            <Button size="sm" variant="outline" onClick={() => markAll('A')} className="border-rose-500/50 text-rose-400">All Absent</Button>
+          </div>
+        </div>
       </div>
 
-      <div className="glass rounded-2xl overflow-x-auto custom-scrollbar">
-        <table className="w-full text-center border-collapse">
-          <thead>
-            <tr className="bg-white/5 border-b border-white/10">
-              <th className="px-6 py-4 text-left text-xs font-bold text-slate-400 uppercase sticky left-0 glass z-10">Member</th>
-              {dates.map(date => (
-                <th key={date} className="px-3 py-4 text-[10px] font-bold text-slate-400 uppercase min-w-[40px]">
-                  {format(new Date(date), 'MM/dd')}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-white/5">
-            {members.map((m: any) => (
-              <tr key={m.id} className="hover:bg-white/5 transition-colors group">
-                <td className="px-6 py-3 text-left text-sm text-white font-medium sticky left-0 glass z-10 group-hover:bg-secondary transition-colors">
-                  {m.name}
-                </td>
-                {dates.map(date => {
-                  const status = getStatus(m.id, date);
-                  return (
-                    <td key={date} className="px-1 py-3">
-                      <button 
-                        onClick={() => cycleStatus(m.id, date)}
-                        className={cn(
-                          "w-8 h-8 mx-auto rounded flex items-center justify-center text-xs font-bold transition-all active:scale-90",
-                          status === 'P' && "bg-emerald-500/20 text-emerald-400",
-                          status === 'A' && "bg-rose-500/20 text-rose-400",
-                          status === 'L' && "bg-amber-500/20 text-amber-400",
-                          status === 'E' && "bg-blue-500/20 text-blue-400",
-                          status === 'S' && "bg-indigo-500/20 text-indigo-400",
-                          status === 'U' && "bg-rose-900/40 text-rose-300",
-                          status === '-' && "text-slate-700 hover:bg-white/5"
-                        )}
-                      >
-                        {status}
-                      </button>
-                    </td>
-                  );
-                })}
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {members.map((m: any) => {
+          const status = getStatus(m.id);
+          return (
+            <Card key={m.id} className={cn(
+              "transition-all",
+              status === 'P' ? "border-emerald-500/30 bg-emerald-500/5" :
+              status === 'A' ? "border-rose-500/30 bg-rose-500/5" :
+              "border-white/5"
+            )}>
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="font-bold text-white">{m.name}</p>
+                  <p className="text-[10px] text-slate-500 uppercase font-bold">{m.role}</p>
+                </div>
+                <div className="flex gap-1">
+                  <button 
+                    onClick={() => setStatus(m.id, 'P')}
+                    className={cn(
+                      "w-8 h-8 rounded flex items-center justify-center transition-all",
+                      status === 'P' ? "bg-emerald-500 text-primary" : "bg-white/5 text-slate-400 hover:bg-white/10"
+                    )}
+                  >
+                    P
+                  </button>
+                  <button 
+                    onClick={() => setStatus(m.id, 'A')}
+                    className={cn(
+                      "w-8 h-8 rounded flex items-center justify-center transition-all",
+                      status === 'A' ? "bg-rose-500 text-white" : "bg-white/5 text-slate-400 hover:bg-white/10"
+                    )}
+                  >
+                    A
+                  </button>
+                  <button 
+                    onClick={() => setStatus(m.id, 'L')}
+                    className={cn(
+                      "w-8 h-8 rounded flex items-center justify-center transition-all",
+                      status === 'L' ? "bg-amber-500 text-primary" : "bg-white/5 text-slate-400 hover:bg-white/10"
+                    )}
+                  >
+                    L
+                  </button>
+                  <button 
+                    onClick={() => setStatus(m.id, '-')}
+                    className="w-8 h-8 rounded flex items-center justify-center bg-white/5 text-slate-400 hover:bg-white/10"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            </Card>
+          );
+        })}
       </div>
     </div>
   );
@@ -879,8 +1125,10 @@ function AttendanceView({ members, attendance, onRefresh }: any) {
 
 function TasksView({ tasks, teams, members, onRefresh, currentUser }: any) {
   const [showAddTask, setShowAddTask] = useState(false);
+  const [showAnalytics, setShowAnalytics] = useState(false);
   const [isBoardTask, setIsBoardTask] = useState(false);
   const [newTask, setNewTask] = useState({ team_id: '', title: '', description: '', assigned_to: '', due_date: '' });
+  const [filterTeam, setFilterTeam] = useState('all');
 
   const isAdmin = currentUser?.role === 'President' || currentUser?.is_board;
 
@@ -895,8 +1143,9 @@ function TasksView({ tasks, teams, members, onRefresh, currentUser }: any) {
   };
 
   const filteredTasks = tasks.filter((t: any) => {
-    if (t.is_board) return isAdmin;
-    return true;
+    const boardCheck = t.is_board ? isAdmin : true;
+    const teamCheck = filterTeam === 'all' || t.team_id?.toString() === filterTeam;
+    return boardCheck && teamCheck;
   });
 
   const updateStatus = async (id: number, status: string) => {
@@ -908,6 +1157,50 @@ function TasksView({ tasks, teams, members, onRefresh, currentUser }: any) {
     onRefresh();
   };
 
+  const handleDeleteTask = async (id: number) => {
+    if (!confirm("Delete this task?")) return;
+    await fetch(`/api/tasks/${id}`, { method: 'DELETE' });
+    onRefresh();
+  };
+
+  // Analytics Data
+  const completionTrends = useMemo(() => {
+    const last7Days = Array.from({ length: 7 }, (_, i) => {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      return format(d, 'yyyy-MM-dd');
+    }).reverse();
+
+    return last7Days.map(date => ({
+      date: format(new Date(date), 'MMM dd'),
+      completed: tasks.filter((t: any) => t.status === 'done' && t.completed_at?.startsWith(date)).length
+    }));
+  }, [tasks]);
+
+  const memberCapacity = useMemo(() => {
+    return members.map((m: any) => {
+      const memberTasks = tasks.filter((t: any) => t.assigned_to === m.id);
+      return {
+        name: m.name,
+        total: memberTasks.length,
+        todo: memberTasks.filter((t: any) => t.status === 'todo').length,
+        inProgress: memberTasks.filter((t: any) => t.status === 'in-progress').length,
+        done: memberTasks.filter((t: any) => t.status === 'done').length,
+      };
+    }).filter(m => m.total > 0);
+  }, [tasks, members]);
+
+  const avgCompletionTime = useMemo(() => {
+    const completedTasks = tasks.filter((t: any) => t.status === 'done' && t.completed_at && t.created_at);
+    if (completedTasks.length === 0) return 0;
+    const totalTime = completedTasks.reduce((acc: number, t: any) => {
+      const start = new Date(t.created_at).getTime();
+      const end = new Date(t.completed_at).getTime();
+      return acc + (end - start);
+    }, 0);
+    return (totalTime / completedTasks.length / (1000 * 60 * 60 * 24)).toFixed(1); // in days
+  }, [tasks]);
+
   const columns = [
     { id: 'todo', label: 'To Do', color: 'bg-slate-500' },
     { id: 'in-progress', label: 'In Progress', color: 'bg-blue-400' },
@@ -916,12 +1209,83 @@ function TasksView({ tasks, teams, members, onRefresh, currentUser }: any) {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h3 className="text-xl font-display font-bold text-white">Task Board</h3>
+      <div className="flex flex-col md:flex-row gap-4 items-center justify-between">
+        <div className="flex items-center gap-3">
+          <Select 
+            className="w-48"
+            options={[
+              { label: 'All Teams', value: 'all' },
+              ...teams.map(t => ({ label: `${t.name} #${t.number}`, value: t.id.toString() }))
+            ]}
+            value={filterTeam} 
+            onChange={(e: any) => setFilterTeam(e.target.value)}
+          />
+          <Button variant="secondary" onClick={() => setShowAnalytics(!showAnalytics)}>
+            <TrendingUp className="w-4 h-4 mr-2" />
+            {showAnalytics ? "Board View" : "Analytics"}
+          </Button>
+        </div>
         <Button onClick={() => setShowAddTask(true)}><Plus className="w-4 h-4" /> New Task</Button>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 h-[calc(100vh-250px)]">
+      {showAnalytics ? (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <Card title="Completion Trend (Last 7 Days)" icon={TrendingUp}>
+            <div className="h-64 mt-4">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={completionTrends}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
+                  <XAxis dataKey="date" stroke="#94a3b8" fontSize={12} />
+                  <YAxis stroke="#94a3b8" fontSize={12} />
+                  <Tooltip 
+                    contentStyle={{ backgroundColor: '#1e293b', border: 'none', borderRadius: '8px', color: '#fff' }}
+                    itemStyle={{ color: '#10b981' }}
+                  />
+                  <Line type="monotone" dataKey="completed" stroke="#10b981" strokeWidth={3} dot={{ fill: '#10b981' }} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </Card>
+
+          <Card title="Member Capacity" icon={Users}>
+            <div className="h-64 mt-4">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={memberCapacity} layout="vertical">
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
+                  <XAxis type="number" stroke="#94a3b8" fontSize={12} />
+                  <YAxis dataKey="name" type="category" stroke="#94a3b8" fontSize={10} width={80} />
+                  <Tooltip 
+                    contentStyle={{ backgroundColor: '#1e293b', border: 'none', borderRadius: '8px', color: '#fff' }}
+                  />
+                  <Bar dataKey="todo" stackId="a" fill="#64748b" />
+                  <Bar dataKey="inProgress" stackId="a" fill="#60a5fa" />
+                  <Bar dataKey="done" stackId="a" fill="#10b981" />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </Card>
+
+          <Card className="lg:col-span-2">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 text-center">
+              <div>
+                <p className="text-xs text-slate-400 uppercase font-bold mb-1">Avg. Completion Time</p>
+                <p className="text-4xl font-display font-bold text-white">{avgCompletionTime} <span className="text-sm font-normal text-slate-500">days</span></p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-400 uppercase font-bold mb-1">Active Tasks</p>
+                <p className="text-4xl font-display font-bold text-blue-400">{tasks.filter(t => t.status !== 'done').length}</p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-400 uppercase font-bold mb-1">Success Rate</p>
+                <p className="text-4xl font-display font-bold text-emerald-400">
+                  {tasks.length > 0 ? Math.round((tasks.filter(t => t.status === 'done').length / tasks.length) * 100) : 0}%
+                </p>
+              </div>
+            </div>
+          </Card>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 h-[calc(100vh-250px)]">
         {columns.map(col => (
           <div key={col.id} className="bg-secondary/30 rounded-2xl p-4 flex flex-col gap-4 border border-white/5">
             <div className="flex items-center gap-2 mb-2">
@@ -938,7 +1302,14 @@ function TasksView({ tasks, teams, members, onRefresh, currentUser }: any) {
                 )}>
                   <div className="flex items-center justify-between mb-1">
                     <h5 className="text-sm font-bold text-white">{task.title}</h5>
-                    {task.is_board && <Lock className="w-3 h-3 text-accent" />}
+                    <div className="flex items-center gap-2">
+                      {task.is_board && <Lock className="w-3 h-3 text-accent" />}
+                      {isAdmin && (
+                        <button onClick={() => handleDeleteTask(task.id)} className="text-slate-600 hover:text-rose-400 transition-colors">
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
                   </div>
                   <p className="text-xs text-slate-400 line-clamp-2 mb-3">{task.description}</p>
                   <div className="flex items-center justify-between">
@@ -959,6 +1330,7 @@ function TasksView({ tasks, teams, members, onRefresh, currentUser }: any) {
           </div>
         ))}
       </div>
+      )}
 
       {showAddTask && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
@@ -1022,6 +1394,12 @@ function BudgetView({ budget, teams, onRefresh }: any) {
     onRefresh();
   };
 
+  const handleDelete = async (id: number) => {
+    if (!confirm("Delete this transaction?")) return;
+    await fetch(`/api/budget/${id}`, { method: 'DELETE' });
+    onRefresh();
+  };
+
   const totalIncome = budget.filter((i: any) => i.type === 'income').reduce((acc: number, i: any) => acc + i.amount, 0);
   const totalExpense = budget.filter((i: any) => i.type === 'expense').reduce((acc: number, i: any) => acc + i.amount, 0);
 
@@ -1055,6 +1433,7 @@ function BudgetView({ budget, teams, onRefresh }: any) {
               <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase">Description</th>
               <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase">Category</th>
               <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase">Amount</th>
+              <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase text-right">Actions</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-white/5">
@@ -1068,6 +1447,11 @@ function BudgetView({ budget, teams, onRefresh }: any) {
                   item.type === 'income' ? 'text-emerald-400' : 'text-rose-400'
                 )}>
                   {item.type === 'income' ? '+' : '-'}${item.amount.toLocaleString()}
+                </td>
+                <td className="px-6 py-4 text-right">
+                  <button onClick={() => handleDelete(item.id)} className="text-slate-600 hover:text-rose-400 transition-colors">
+                    <Trash2 className="w-4 h-4" />
+                  </button>
                 </td>
               </tr>
             ))}
@@ -1115,7 +1499,7 @@ function BudgetView({ budget, teams, onRefresh }: any) {
   );
 }
 
-function OutreachView({ events, onRefresh }: any) {
+function OutreachView({ outreach, onRefresh }: any) {
   const [showAdd, setShowAdd] = useState(false);
   const [newEvent, setNewEvent] = useState({ title: '', description: '', date: format(new Date(), 'yyyy-MM-dd'), hours: '', location: '' });
 
@@ -1129,6 +1513,12 @@ function OutreachView({ events, onRefresh }: any) {
     onRefresh();
   };
 
+  const handleDelete = async (id: number) => {
+    if (!confirm("Delete this event?")) return;
+    await fetch(`/api/outreach/${id}`, { method: 'DELETE' });
+    onRefresh();
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -1137,16 +1527,19 @@ function OutreachView({ events, onRefresh }: any) {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        {events.map((event: any) => (
+        {(outreach || []).map((event: any) => (
           <Card key={event.id} title={event.title} icon={Globe}>
             <div className="flex justify-between items-start">
               <div>
                 <p className="text-xs text-slate-400">{event.location} • {event.date}</p>
                 <p className="text-sm text-slate-300 mt-2">{event.description}</p>
               </div>
-              <div className="text-right">
+              <div className="text-right flex flex-col items-end gap-2">
                 <p className="text-2xl font-display font-bold text-accent">{event.hours}h</p>
                 <p className="text-[10px] text-slate-400 uppercase font-bold">Logged</p>
+                <button onClick={() => handleDelete(event.id)} className="text-slate-600 hover:text-rose-400 transition-colors mt-2">
+                  <Trash2 className="w-4 h-4" />
+                </button>
               </div>
             </div>
           </Card>
@@ -1217,6 +1610,12 @@ function CommunicationView({ communications, onRefresh }: any) {
     onRefresh();
   };
 
+  const handleDelete = async (id: number) => {
+    if (!confirm("Delete this log?")) return;
+    await fetch(`/api/communications/${id}`, { method: 'DELETE' });
+    onRefresh();
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -1244,6 +1643,9 @@ function CommunicationView({ communications, onRefresh }: any) {
                 <p className="text-sm text-slate-400 mb-3">To: {comm.recipient}</p>
                 <p className="text-sm text-slate-300 whitespace-pre-wrap">{comm.body}</p>
               </div>
+              <button onClick={() => handleDelete(comm.id)} className="text-slate-600 hover:text-rose-400 transition-colors">
+                <Trash2 className="w-4 h-4" />
+              </button>
             </div>
           </Card>
         ))}
@@ -1297,7 +1699,27 @@ function ChatView({ messages, members, currentUser, socket }: any) {
 
   const handleSend = () => {
     if (!content.trim() || !socket) return;
-    socket.send(JSON.stringify({ type: 'chat', sender_id: currentUser.id, content }));
+    
+    // Convert mentions to searchable format
+    let finalContent = content;
+    const mentionRegex = /@(\w+)/g;
+    const matches = content.match(mentionRegex);
+    if (matches) {
+      matches.forEach(m => {
+        const name = m.slice(1);
+        const member = members.find((mem: any) => mem.name.toLowerCase() === name.toLowerCase());
+        if (member) {
+          finalContent = finalContent.replace(m, `@[${member.name}]`);
+        }
+      });
+    }
+
+    socket.send(JSON.stringify({
+      type: 'chat',
+      sender_id: currentUser.id,
+      sender_name: currentUser.name,
+      content: finalContent
+    }));
     setContent('');
   };
 
@@ -1344,7 +1766,13 @@ function ChatView({ messages, members, currentUser, socket }: any) {
               "px-4 py-2 rounded-2xl max-w-[80%] text-sm",
               msg.sender_id === currentUser.id ? "bg-accent text-primary font-medium" : "bg-white/5 text-white border border-white/5"
             )}>
-              {msg.content}
+              {msg.content.split(/(@\[[^\]]+\])/).map((part: string, i: number) => {
+                if (part.startsWith('@[') && part.endsWith(']')) {
+                  const name = part.slice(2, -1);
+                  return <span key={i} className="font-bold underline decoration-accent decoration-2 underline-offset-2">@{name}</span>;
+                }
+                return part;
+              })}
             </div>
           </div>
         ))}
@@ -1384,8 +1812,11 @@ function ChatView({ messages, members, currentUser, socket }: any) {
   );
 }
 
-function SettingsView({ settings, onRefresh }: any) {
+function SettingsView({ settings, members, onRefresh, currentUser }: any) {
   const [criteria, setCriteria] = useState(settings.excuse_criteria || '');
+  const [showMemberEdit, setShowMemberEdit] = useState<any>(null);
+
+  const isPresident = currentUser?.role === 'President';
 
   const handleSave = async () => {
     await fetch('/api/settings', {
@@ -1394,32 +1825,111 @@ function SettingsView({ settings, onRefresh }: any) {
       body: JSON.stringify({ key: 'excuse_criteria', value: criteria })
     });
     onRefresh();
+    alert('Settings saved');
+  };
+
+  const updateMember = async (id: number, data: any) => {
+    await fetch(`/api/members/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    onRefresh();
+    setShowMemberEdit(null);
   };
 
   return (
-    <div className="max-w-2xl space-y-8">
-      <Card title="AI Excuse Criteria" icon={Settings}>
-        <p className="text-sm text-slate-400 mb-4">Define what constitutes an "Excused" absence. The AI will use this to automatically categorize "I'm Out" requests.</p>
-        <textarea 
-          className="w-full bg-primary border border-white/10 rounded-xl px-4 py-2 text-white focus:outline-none focus:border-accent/50 transition-colors h-32 mb-4"
-          value={criteria}
-          onChange={(e) => setCriteria(e.target.value)}
-        />
-        <Button onClick={handleSave}>Save Settings</Button>
-      </Card>
-
-      <Card title="Notification Settings" icon={Globe}>
+    <div className="max-w-4xl space-y-8">
+      <Card title="AI Absence Evaluation" icon={Settings}>
         <div className="space-y-4">
-          <label className="flex items-center justify-between p-3 bg-white/5 rounded-xl border border-white/5">
-            <span className="text-sm text-white">Email Notifications for Tasks</span>
-            <input type="checkbox" defaultChecked className="accent-accent" />
-          </label>
-          <label className="flex items-center justify-between p-3 bg-white/5 rounded-xl border border-white/5">
-            <span className="text-sm text-white">Browser Push for Messages</span>
-            <input type="checkbox" defaultChecked className="accent-accent" />
-          </label>
+          <p className="text-sm text-slate-400">Define the criteria Gemini should use to determine if an absence is excused.</p>
+          <textarea 
+            className="w-full bg-primary border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-accent/50 transition-colors h-48 text-sm"
+            placeholder="e.g. Excused if: sick with doctor note, family emergency, school event. Unexcused if: forgot, overslept, gaming..."
+            value={criteria}
+            onChange={(e) => setCriteria(e.target.value)}
+          />
+          <Button onClick={handleSave}>Save Criteria</Button>
         </div>
       </Card>
+
+      {isPresident && (
+        <Card title="Admin Delegation" icon={Users}>
+          <div className="space-y-4">
+            <p className="text-sm text-slate-400">Grant administrative scopes to board members.</p>
+            <div className="glass rounded-xl overflow-hidden">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-white/5 border-b border-white/10">
+                  <tr>
+                    <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase">Name</th>
+                    <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase">Board</th>
+                    <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase">Scopes</th>
+                    <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase text-right">Action</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/5">
+                  {members.map((m: any) => (
+                    <tr key={m.id}>
+                      <td className="px-4 py-3 text-white">{m.name}</td>
+                      <td className="px-4 py-3">
+                        <button 
+                          onClick={() => updateMember(m.id, { ...m, is_board: m.is_board ? 0 : 1 })}
+                          className={cn(
+                            "px-2 py-1 rounded text-[10px] font-bold uppercase",
+                            m.is_board ? "bg-accent/20 text-accent" : "bg-slate-800 text-slate-500"
+                          )}
+                        >
+                          {m.is_board ? 'Yes' : 'No'}
+                        </button>
+                      </td>
+                      <td className="px-4 py-3 text-xs text-slate-500">
+                        {JSON.parse(m.scopes).join(', ') || 'None'}
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <Button variant="secondary" size="sm" onClick={() => setShowMemberEdit(m)}>Edit Scopes</Button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {showMemberEdit && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <Card title={`Edit Scopes: ${showMemberEdit.name}`} className="w-full max-w-md">
+            <div className="space-y-4">
+              <div className="flex flex-wrap gap-2">
+                {['attendance', 'budget', 'tasks', 'admin'].map(s => {
+                  const currentScopes = JSON.parse(showMemberEdit.scopes);
+                  const active = currentScopes.includes(s);
+                  return (
+                    <button 
+                      key={s}
+                      onClick={() => {
+                        const next = active ? currentScopes.filter((x: string) => x !== s) : [...currentScopes, s];
+                        setShowMemberEdit({ ...showMemberEdit, scopes: JSON.stringify(next) });
+                      }}
+                      className={cn(
+                        "px-3 py-1 rounded-full text-[10px] font-bold uppercase border transition-all",
+                        active ? "bg-accent border-accent text-primary" : "border-white/10 text-slate-400"
+                      )}
+                    >
+                      {s}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="flex gap-3 justify-end">
+                <Button variant="secondary" onClick={() => setShowMemberEdit(null)}>Cancel</Button>
+                <Button onClick={() => updateMember(showMemberEdit.id, showMemberEdit)}>Save Changes</Button>
+              </div>
+            </div>
+          </Card>
+        </div>
+      )}
     </div>
   );
 }

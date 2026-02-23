@@ -55,6 +55,9 @@ if (!taskColumns.some((c: any) => c.name === 'is_board')) {
   db.exec("ALTER TABLE tasks ADD COLUMN is_board INTEGER DEFAULT 0");
 }
 
+// Migration: Add unique index to attendance for INSERT OR REPLACE
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_member_date ON attendance(member_id, date)");
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS attendance (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,7 +66,22 @@ db.exec(`
     status TEXT NOT NULL, -- 'P', 'A', 'L', 'E', 'U', 'S'
     reason TEXT,
     is_excused INTEGER DEFAULT 0,
-    FOREIGN KEY(member_id) REFERENCES members(id)
+    FOREIGN KEY(member_id) REFERENCES members(id),
+    UNIQUE(member_id, date)
+  );
+
+  CREATE TABLE IF NOT EXISTS hidden_dates (
+    date TEXT PRIMARY KEY
+  );
+
+  CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    content TEXT NOT NULL,
+    type TEXT NOT NULL, -- 'mention', 'task', 'system'
+    is_read INTEGER DEFAULT 0,
+    timestamp TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES members(id)
   );
 
   CREATE TABLE IF NOT EXISTS messages (
@@ -90,9 +108,21 @@ db.exec(`
     status TEXT DEFAULT 'todo', -- 'todo', 'in-progress', 'done'
     assigned_to INTEGER,
     due_date TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
     is_board INTEGER DEFAULT 0,
     FOREIGN KEY(team_id) REFERENCES teams(id),
     FOREIGN KEY(assigned_to) REFERENCES members(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS documentation (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL, -- 'meeting', 'funding', 'milestone'
+    title TEXT NOT NULL,
+    content TEXT,
+    images TEXT, -- JSON array of base64 or URLs
+    date TEXT NOT NULL,
+    created_at TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS budget (
@@ -135,24 +165,66 @@ async function startServer() {
 
   // --- WebSocket Logic ---
   const clients = new Set<WebSocket>();
+  
+  const broadcast = (data: any) => {
+    const payload = JSON.stringify(data);
+    clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) client.send(payload);
+    });
+  };
+
+  const createNotification = (userId: number, content: string, type: string) => {
+    const timestamp = new Date().toISOString();
+    const info = db.prepare("INSERT INTO notifications (user_id, content, type, timestamp) VALUES (?, ?, ?, ?)")
+      .run(userId, content, type, timestamp);
+    
+    broadcast({
+      type: 'notification',
+      notification: {
+        id: info.lastInsertRowid,
+        user_id: userId,
+        content,
+        type,
+        timestamp,
+        is_read: 0
+      }
+    });
+  };
+
   wss.on("connection", (ws) => {
     clients.add(ws);
     ws.on("close", () => clients.delete(ws));
     ws.on("message", (data) => {
-      const message = JSON.parse(data.toString());
-      if (message.type === "chat") {
-        const stmt = db.prepare("INSERT INTO messages (sender_id, content, timestamp) VALUES (?, ?, ?)");
-        const info = stmt.run(message.sender_id, message.content, new Date().toISOString());
-        const broadcast = JSON.stringify({
-          type: "chat",
-          id: info.lastInsertRowid,
-          sender_id: message.sender_id,
-          content: message.content,
-          timestamp: new Date().toISOString()
-        });
-        clients.forEach(client => {
-          if (client.readyState === WebSocket.OPEN) client.send(broadcast);
-        });
+      try {
+        const message = JSON.parse(data.toString());
+        if (message.type === "chat") {
+          const stmt = db.prepare("INSERT INTO messages (sender_id, content, timestamp) VALUES (?, ?, ?)");
+          const timestamp = new Date().toISOString();
+          const info = stmt.run(message.sender_id, message.content, timestamp);
+          
+          // Handle mentions
+          const mentions = message.content.match(/@\[([^\]]+)\]/g);
+          if (mentions) {
+            mentions.forEach((m: string) => {
+              const name = m.slice(2, -1);
+              const user = db.prepare("SELECT id FROM members WHERE name = ?").get(name) as any;
+              if (user) {
+                createNotification(user.id, `You were mentioned by ${message.sender_name}: "${message.content}"`, 'mention');
+              }
+            });
+          }
+
+          broadcast({
+            type: "chat",
+            id: info.lastInsertRowid,
+            sender_id: message.sender_id,
+            sender_name: message.sender_name,
+            content: message.content,
+            timestamp
+          });
+        }
+      } catch (err) {
+        console.error("WS Message Error:", err);
       }
     });
   });
@@ -203,6 +275,17 @@ async function startServer() {
     res.json({ id: info.lastInsertRowid });
   });
 
+  app.patch("/api/teams/:id", (req, res) => {
+    const { name, number } = req.body;
+    db.prepare("UPDATE teams SET name = ?, number = ? WHERE id = ?").run(name, number, req.params.id);
+    res.json({ success: true });
+  });
+
+  app.delete("/api/teams/:id", (req, res) => {
+    db.prepare("DELETE FROM teams WHERE id = ?").run(req.params.id);
+    res.json({ success: true });
+  });
+
   // Members
   app.get("/api/members", (req, res) => {
     const members = db.prepare(`
@@ -220,19 +303,82 @@ async function startServer() {
     res.json({ id: info.lastInsertRowid });
   });
 
+  app.patch("/api/members/:id", (req, res) => {
+    const { team_id, name, role, email, is_board, scopes } = req.body;
+    db.prepare("UPDATE members SET team_id = ?, name = ?, role = ?, email = ?, is_board = ?, scopes = ? WHERE id = ?")
+      .run(team_id, name, role, email, is_board ? 1 : 0, JSON.stringify(scopes || []), req.params.id);
+    res.json({ success: true });
+  });
+
+  app.delete("/api/members/:id", (req, res) => {
+    db.prepare("DELETE FROM members WHERE id = ?").run(req.params.id);
+    res.json({ success: true });
+  });
+
   // Attendance
   app.get("/api/attendance", (req, res) => {
-    const records = db.prepare("SELECT * FROM attendance").all();
-    res.json(records);
+    try {
+      const { date } = req.query;
+      let query = "SELECT * FROM attendance";
+      let params: any[] = [];
+      if (date) {
+        query += " WHERE date = ?";
+        params.push(date);
+      }
+      const records = db.prepare(query).all(...params);
+      res.json(records);
+    } catch (error) {
+      console.error("Error fetching attendance:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
   });
 
   app.post("/api/attendance/batch", (req, res) => {
-    const { date, records } = req.body; // records: [{member_id, status, reason}]
-    const insert = db.prepare("INSERT OR REPLACE INTO attendance (member_id, date, status, reason) VALUES (?, ?, ?, ?)");
-    const transaction = db.transaction((data) => {
-      for (const rec of data) insert.run(rec.member_id, date, rec.status, rec.reason || null);
-    });
-    transaction(records);
+    try {
+      const { date, records } = req.body;
+      if (!date || !Array.isArray(records)) {
+        return res.status(400).json({ error: "Invalid request body" });
+      }
+
+      const insert = db.prepare("INSERT OR REPLACE INTO attendance (member_id, date, status, reason) VALUES (?, ?, ?, ?)");
+      const deleteStmt = db.prepare("DELETE FROM attendance WHERE member_id = ? AND date = ?");
+      
+      const transaction = db.transaction((data) => {
+        for (const rec of data) {
+          if (rec.status === null || rec.status === '-') {
+            deleteStmt.run(rec.member_id, date);
+          } else {
+            insert.run(rec.member_id, date, rec.status, rec.reason || null);
+          }
+        }
+      });
+
+      transaction(records);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error in attendance batch:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  app.get("/api/hidden-dates", (req, res) => {
+    try {
+      const dates = db.prepare("SELECT date FROM hidden_dates").all();
+      res.json(dates.map((d: any) => d.date));
+    } catch (error) {
+      console.error("Error fetching hidden dates:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  app.post("/api/hidden-dates", (req, res) => {
+    const { date } = req.body;
+    db.prepare("INSERT OR IGNORE INTO hidden_dates (date) VALUES (?)").run(date);
+    res.json({ success: true });
+  });
+
+  app.delete("/api/hidden-dates/:date", (req, res) => {
+    db.prepare("DELETE FROM hidden_dates WHERE date = ?").run(req.params.date);
     res.json({ success: true });
   });
 
@@ -247,74 +393,246 @@ async function startServer() {
     res.json(msgs);
   });
 
+  // Notifications
+  app.get("/api/notifications/:userId", (req, res) => {
+    const notes = db.prepare("SELECT * FROM notifications WHERE user_id = ? ORDER BY timestamp DESC LIMIT 50")
+      .all(req.params.userId);
+    res.json(notes);
+  });
+
+  app.post("/api/notifications/read", (req, res) => {
+    const { ids } = req.body;
+    const stmt = db.prepare("UPDATE notifications SET is_read = 1 WHERE id = ?");
+    const transaction = db.transaction((data) => {
+      for (const id of data) stmt.run(id);
+    });
+    transaction(ids);
+    res.json({ success: true });
+  });
+
   // Settings
   app.get("/api/settings", (req, res) => {
-    const settings = db.prepare("SELECT * FROM settings").all();
-    res.json(settings);
+    try {
+      const settings = db.prepare("SELECT * FROM settings").all();
+      res.json(settings);
+    } catch (error) {
+      console.error("Error fetching settings:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
   });
 
   app.post("/api/settings", (req, res) => {
-    const { key, value } = req.body;
-    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(key, value);
-    res.json({ success: true });
+    try {
+      const { key, value } = req.body;
+      db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(key, value);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error saving settings:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
   });
 
   // Tasks
   app.get("/api/tasks", (req, res) => {
-    const tasks = db.prepare("SELECT * FROM tasks").all();
-    res.json(tasks);
+    try {
+      const tasks = db.prepare("SELECT * FROM tasks").all();
+      res.json(tasks);
+    } catch (error) {
+      console.error("Error fetching tasks:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
   });
 
   app.post("/api/tasks", (req, res) => {
-    const { team_id, title, description, status, assigned_to, due_date, is_board } = req.body;
-    const info = db.prepare("INSERT INTO tasks (team_id, title, description, status, assigned_to, due_date, is_board) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(team_id, title, description, status || 'todo', assigned_to, due_date, is_board || 0);
-    res.json({ id: info.lastInsertRowid });
+    try {
+      const { team_id, title, description, status, assigned_to, due_date, is_board } = req.body;
+      const createdAt = new Date().toISOString();
+      const info = db.prepare("INSERT INTO tasks (team_id, title, description, status, assigned_to, due_date, is_board, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(team_id, title, description, status || 'todo', assigned_to, due_date, is_board || 0, createdAt);
+      
+      if (assigned_to) {
+        createNotification(assigned_to, `New task assigned: ${title}`, 'task');
+      }
+      
+      res.json({ id: info.lastInsertRowid });
+    } catch (error) {
+      console.error("Error creating task:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
   });
 
   app.patch("/api/tasks/:id", (req, res) => {
-    const { status } = req.body;
-    db.prepare("UPDATE tasks SET status = ? WHERE id = ?").run(status, req.params.id);
-    res.json({ success: true });
+    try {
+      const { status } = req.body;
+      const completedAt = status === 'done' ? new Date().toISOString() : null;
+      
+      if (status === 'done') {
+        db.prepare("UPDATE tasks SET status = ?, completed_at = ? WHERE id = ?").run(status, completedAt, req.params.id);
+      } else {
+        db.prepare("UPDATE tasks SET status = ?, completed_at = NULL WHERE id = ?").run(status, req.params.id);
+      }
+      
+      const task = db.prepare("SELECT * FROM tasks WHERE id = ?").get(req.params.id) as any;
+      if (task && task.assigned_to) {
+        createNotification(task.assigned_to, `Task status updated to ${status}: ${task.title}`, 'task');
+      }
+      
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error updating task:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  app.delete("/api/tasks/:id", (req, res) => {
+    try {
+      db.prepare("DELETE FROM tasks WHERE id = ?").run(req.params.id);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error deleting task:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
   });
 
   // Budget
   app.get("/api/budget", (req, res) => {
-    const budget = db.prepare("SELECT * FROM budget").all();
-    res.json(budget);
+    try {
+      const budget = db.prepare("SELECT * FROM budget").all();
+      res.json(budget);
+    } catch (error) {
+      console.error("Error fetching budget:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
   });
 
   app.post("/api/budget", (req, res) => {
-    const { team_id, type, amount, category, description, date } = req.body;
-    const info = db.prepare("INSERT INTO budget (team_id, type, amount, category, description, date) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(team_id, type, amount, category, description, date);
-    res.json({ id: info.lastInsertRowid });
+    try {
+      const { team_id, type, amount, category, description, date } = req.body;
+      const info = db.prepare("INSERT INTO budget (team_id, type, amount, category, description, date) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(team_id, type, amount, category, description, date);
+      
+      // Notify board members of budget changes
+      const boardMembers = db.prepare("SELECT id FROM members WHERE is_board = 1").all();
+      boardMembers.forEach((m: any) => {
+        createNotification(m.id, `New budget ${type}: $${amount} for ${category}`, 'system');
+      });
+
+      res.json({ id: info.lastInsertRowid });
+    } catch (error) {
+      console.error("Error creating budget item:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  app.delete("/api/budget/:id", (req, res) => {
+    try {
+      db.prepare("DELETE FROM budget WHERE id = ?").run(req.params.id);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error deleting budget item:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
   });
 
   // Outreach
   app.get("/api/outreach", (req, res) => {
-    const outreach = db.prepare("SELECT * FROM outreach").all();
-    res.json(outreach);
+    try {
+      const outreach = db.prepare("SELECT * FROM outreach").all();
+      res.json(outreach);
+    } catch (error) {
+      console.error("Error fetching outreach:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
   });
 
   app.post("/api/outreach", (req, res) => {
-    const { title, description, date, hours, location } = req.body;
-    const info = db.prepare("INSERT INTO outreach (title, description, date, hours, location) VALUES (?, ?, ?, ?, ?)")
-      .run(title, description, date, hours, location);
-    res.json({ id: info.lastInsertRowid });
+    try {
+      const { title, description, date, hours, location } = req.body;
+      const info = db.prepare("INSERT INTO outreach (title, description, date, hours, location) VALUES (?, ?, ?, ?, ?)")
+        .run(title, description, date, hours, location);
+      
+      // Notify everyone of new outreach
+      const allMembers = db.prepare("SELECT id FROM members").all();
+      allMembers.forEach((m: any) => {
+        createNotification(m.id, `New outreach event: ${title} at ${location}`, 'system');
+      });
+
+      res.json({ id: info.lastInsertRowid });
+    } catch (error) {
+      console.error("Error creating outreach event:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
   });
 
-  // Communications
+  app.delete("/api/outreach/:id", (req, res) => {
+    try {
+      db.prepare("DELETE FROM outreach WHERE id = ?").run(req.params.id);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error deleting outreach event:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  // Documentation
+  app.get("/api/documentation", (req, res) => {
+    try {
+      const docs = db.prepare("SELECT * FROM documentation ORDER BY date DESC").all();
+      res.json(docs);
+    } catch (error) {
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  app.post("/api/documentation", (req, res) => {
+    try {
+      const { type, title, content, images, date } = req.body;
+      const info = db.prepare("INSERT INTO documentation (type, title, content, images, date, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(type, title, content, JSON.stringify(images || []), date, new Date().toISOString());
+      res.json({ id: info.lastInsertRowid });
+    } catch (error) {
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  app.delete("/api/documentation/:id", (req, res) => {
+    try {
+      db.prepare("DELETE FROM documentation WHERE id = ?").run(req.params.id);
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
   app.get("/api/communications", (req, res) => {
-    const comms = db.prepare("SELECT * FROM communications ORDER BY date DESC").all();
-    res.json(comms);
+    try {
+      const comms = db.prepare("SELECT * FROM communications ORDER BY date DESC").all();
+      res.json(comms);
+    } catch (error) {
+      console.error("Error fetching communications:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
   });
 
   app.post("/api/communications", (req, res) => {
-    const { recipient, subject, body, date, type } = req.body;
-    const info = db.prepare("INSERT INTO communications (recipient, subject, body, date, type) VALUES (?, ?, ?, ?, ?)")
-      .run(recipient, subject, body, date, type || 'email');
-    res.json({ id: info.lastInsertRowid });
+    try {
+      const { recipient, subject, body, date, type } = req.body;
+      const info = db.prepare("INSERT INTO communications (recipient, subject, body, date, type) VALUES (?, ?, ?, ?, ?)")
+        .run(recipient, subject, body, date, type || 'email');
+      res.json({ id: info.lastInsertRowid });
+    } catch (error) {
+      console.error("Error creating communication:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  app.delete("/api/communications/:id", (req, res) => {
+    try {
+      db.prepare("DELETE FROM communications WHERE id = ?").run(req.params.id);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error deleting communication:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
   });
 
   // Vite middleware for development

@@ -45,3 +45,24 @@ export async function checkExcuse(reason: string, criteria: string) {
     return "UNEXCUSED - AI error.";
   }
 }
+
+export async function getActivitySummary(data: any) {
+  try {
+    const { tasks, messages, budget, userScope } = data;
+    const payload = JSON.stringify({ tasks, messages, budget });
+    const response = await ai.models.generateContent({
+      model: "gemini-3-flash-preview",
+      contents: `Provide a concise executive summary of the recent club activity based on the following data. 
+      The user viewing this has the following role/scope: ${JSON.stringify(userScope)}. 
+      Only include information that would be relevant or accessible to someone with this scope. 
+      Highlight progress, concerns, and upcoming deadlines. Keep it professional and scannable.
+      
+      Data: ${payload}`,
+    });
+
+    return response.text || "No summary available.";
+  } catch (error) {
+    console.error("Error getting activity summary:", error);
+    return "Summary unavailable.";
+  }
+}
