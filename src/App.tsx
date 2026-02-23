@@ -28,6 +28,7 @@ import {
   Edit2,
   Calendar,
   User,
+  UserCircle,
   Zap,
   Trash2,
   Camera,
@@ -225,7 +226,13 @@ export default function App() {
       ]);
 
       if (Array.isArray(t)) setTeams(t);
-      if (Array.isArray(m)) setMembers(m);
+      if (Array.isArray(m)) {
+        setMembers(m);
+        if (currentUser) {
+          const updatedUser = m.find((member: any) => member.id === currentUser.id);
+          if (updatedUser) setCurrentUser(updatedUser);
+        }
+      }
       if (Array.isArray(a)) setAttendance(a);
       if (Array.isArray(tk)) setTasks(tk);
       if (Array.isArray(b)) setBudget(b);
@@ -273,7 +280,7 @@ export default function App() {
         email: loginEmail, 
         role: 'President', 
         is_board: 1, 
-        scopes: JSON.stringify(['attendance', 'budget', 'tasks', 'admin']) 
+        scopes: ['attendance', 'budget', 'tasks', 'admin']
       };
       const res = await fetch('/api/members', {
         method: 'POST',
@@ -341,8 +348,14 @@ export default function App() {
     if (currentUser.role === 'President') return true;
     if (scope === 'admin' && currentUser.is_board) return true;
     try {
-      const scopes = typeof currentUser.scopes === 'string' ? JSON.parse(currentUser.scopes) : currentUser.scopes;
-      return scopes.includes(scope);
+      let scopes = currentUser.scopes;
+      // Handle double-stringification if it somehow happened in the DB
+      while (typeof scopes === 'string') {
+        const parsed = JSON.parse(scopes);
+        if (typeof parsed === 'string') scopes = parsed;
+        else { scopes = parsed; break; }
+      }
+      return Array.isArray(scopes) ? scopes.includes(scope) : false;
     } catch {
       return false;
     }
@@ -358,6 +371,7 @@ export default function App() {
     { id: 'comm', label: 'Communication', icon: Mail },
     { id: 'chat', label: 'Messaging', icon: MessageSquare },
     { id: 'scout', label: 'AI Scout', icon: Newspaper },
+    { id: 'profile', label: 'My Profile', icon: UserCircle },
     { id: 'settings', label: 'Admin Settings', icon: Settings, scope: 'admin' },
   ];
 
@@ -365,10 +379,10 @@ export default function App() {
     const viewProps = {
       teams, members, attendance, tasks, budget, outreach, communications, 
       messages, settings, hiddenDates, currentUser, onRefresh: fetchData, setLoading,
-      insights, news, summary, socket
+      insights, news, summary, socket, hasScope
     };
     switch (activeTab) {
-      case 'dashboard': return <DashboardView {...viewProps} data={{ attendance, tasks, budget, outreach, insights, news, summary }} />;
+      case 'dashboard': return <DashboardView {...viewProps} data={{ attendance, tasks, budget, outreach, insights, news, summary, members }} />;
       case 'teams': return <TeamsView {...viewProps} />;
       case 'attendance': return <AttendanceView {...viewProps} />;
       case 'tasks': return <TasksView {...viewProps} />;
@@ -377,6 +391,7 @@ export default function App() {
       case 'comm': return <CommunicationView {...viewProps} />;
       case 'chat': return <ChatView {...viewProps} />;
       case 'scout': return <ScoutView {...viewProps} />;
+      case 'profile': return <ProfileView {...viewProps} />;
       case 'settings': return <SettingsView {...viewProps} />;
       default: return null;
     }
@@ -483,13 +498,18 @@ export default function App() {
 
         <div className="p-4 border-t border-white/5">
           <div className="flex items-center gap-3 p-3 mb-2">
-            <div className="w-8 h-8 rounded-full bg-accent flex items-center justify-center text-primary font-bold text-xs">
+            <button 
+              onClick={() => setActiveTab('profile')}
+              className="w-8 h-8 rounded-full bg-accent flex items-center justify-center text-primary font-bold text-xs hover:ring-2 hover:ring-accent-hover transition-all"
+            >
               {currentUser?.name.charAt(0)}
-            </div>
+            </button>
             {isSidebarOpen && (
               <div className="flex-1 min-w-0">
                 <p className="text-xs font-bold text-white truncate">{currentUser?.name}</p>
-                <button onClick={handleLogout} className="text-[10px] text-rose-400 hover:underline">Logout</button>
+                <button onClick={handleLogout} className="flex items-center gap-1 text-[10px] text-rose-400 hover:text-rose-300 transition-colors">
+                  <LogOut className="w-3 h-3" /> Sign Out
+                </button>
               </div>
             )}
           </div>
@@ -607,48 +627,69 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: a
   const [outReason, setOutReason] = useState('');
 
   const today = format(new Date(), 'yyyy-MM-dd');
-  const myStatus = data.attendance.find((r: any) => r.member_id === currentUser.id && r.date === today);
+  const myStatus = data.attendance?.find((r: any) => r.member_id === currentUser?.id && r.date === today);
 
-  const handleImOut = async () => {
+  const handleSelfReport = async (status: string, reason?: string) => {
     setLoading(true);
     try {
-      const excuseResult = await checkExcuse(outReason, settings.excuse_criteria);
-      const isExcused = excuseResult.includes("EXCUSED");
-      const status = isExcused ? 'E' : 'U';
+      let finalStatus = status;
+      let aiNote = '';
       
+      if (status === 'O' && reason) {
+        const excuseResult = await checkExcuse(reason, settings.excuse_criteria);
+        const isExcused = excuseResult.includes("EXCUSED");
+        finalStatus = isExcused ? 'E' : 'U';
+        aiNote = excuseResult;
+      }
+
       const res = await fetch('/api/attendance/batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          date: format(new Date(), 'yyyy-MM-dd'),
-          records: [{ member_id: currentUser.id, status, reason: outReason }]
+          date: today,
+          records: [{ member_id: currentUser.id, status: finalStatus, reason }]
         })
       });
       if (res.ok) {
         setShowOut(false);
         onRefresh();
-        alert(`Absence logged as ${isExcused ? 'EXCUSED' : 'UNEXCUSED'}. AI Note: ${excuseResult}`);
+        if (aiNote) alert(`Absence logged. AI Note: ${aiNote}`);
       }
     } finally {
       setLoading(false);
     }
   };
-  const totalBudget = data.budget.reduce((acc: number, item: any) => 
+
+  const totalBudget = data.budget?.reduce((acc: number, item: any) => 
     item.type === 'income' ? acc + item.amount : acc - item.amount, 0
-  );
+  ) || 0;
 
-  const attendanceRate = data.attendance.length > 0 
-    ? (data.attendance.filter((r: any) => r.status === 'P').length / data.attendance.length * 100).toFixed(1)
-    : 0;
+  const todayAttendance = data.attendance?.filter((r: any) => r.date === today) || [];
+  const attendanceRate = todayAttendance.length > 0
+    ? (todayAttendance.filter((r: any) => r.status === 'P' || r.status === 'L').length / (data.members?.length || 1) * 100).toFixed(0)
+    : (data.attendance?.filter((r: any) => r.status === 'P').length / Math.max(1, data.attendance?.length || 0) * 100).toFixed(0);
 
-  const activeTasks = data.tasks.filter((t: any) => t.status !== 'done').length;
+  const activeTasks = data.tasks?.filter((t: any) => t.status !== 'done').length || 0;
+
+  const chartData = useMemo(() => {
+    const last14Days = Array.from({ length: 14 }, (_, i) => {
+      const d = new Date();
+      d.setDate(d.getDate() - (13 - i));
+      return format(d, 'yyyy-MM-dd');
+    });
+
+    return last14Days.map(date => ({
+      date: format(new Date(date), 'MMM dd'),
+      count: data.attendance?.filter((r: any) => r.date === date && (r.status === 'P' || r.status === 'L')).length || 0
+    }));
+  }, [data.attendance]);
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 pb-20">
       <Card title="Club Health" icon={TrendingUp} className="lg:col-span-2">
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div className="p-4 bg-white/5 rounded-2xl border border-white/5">
-            <p className="text-xs text-slate-400 uppercase font-bold mb-1">Attendance</p>
+            <p className="text-xs text-slate-400 uppercase font-bold mb-1">Attendance {todayAttendance.length > 0 ? '(Today)' : '(Avg)'}</p>
             <p className="text-2xl sm:text-3xl font-display font-bold text-accent">{attendanceRate}%</p>
           </div>
           <div className="p-4 bg-white/5 rounded-2xl border border-white/5">
@@ -663,15 +704,15 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: a
         
         <div className="mt-6 h-64 min-h-[250px]">
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={data.attendance.slice(-10)}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" />
-              <XAxis dataKey="date" stroke="#94a3b8" fontSize={10} />
-              <YAxis stroke="#94a3b8" fontSize={10} />
+            <LineChart data={chartData}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" vertical={false} />
+              <XAxis dataKey="date" stroke="#94a3b8" fontSize={10} axisLine={false} tickLine={false} />
+              <YAxis stroke="#94a3b8" fontSize={10} axisLine={false} tickLine={false} />
               <Tooltip 
                 contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #ffffff20', borderRadius: '12px' }}
                 itemStyle={{ color: '#fbbf24' }}
               />
-              <Line type="monotone" dataKey="id" stroke="#fbbf24" strokeWidth={3} dot={{ fill: '#fbbf24' }} />
+              <Line type="monotone" dataKey="count" stroke="#fbbf24" strokeWidth={3} dot={{ fill: '#fbbf24', strokeWidth: 2, r: 4 }} activeDot={{ r: 6 }} />
             </LineChart>
           </ResponsiveContainer>
         </div>
@@ -687,10 +728,11 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: a
         <div className="space-y-4">
           {myStatus ? (
             <div className={cn(
-              "p-4 rounded-xl border flex flex-col gap-2",
+              "p-4 rounded-xl border flex flex-col gap-2 transition-all",
               myStatus.status === 'P' ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400" :
               myStatus.status === 'A' ? "bg-rose-500/10 border-rose-500/30 text-rose-400" :
-              "bg-amber-500/10 border-amber-500/30 text-amber-400"
+              myStatus.status === 'L' ? "bg-amber-500/10 border-amber-500/30 text-amber-400" :
+              "bg-blue-500/10 border-blue-500/30 text-blue-400"
             )}>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
@@ -698,18 +740,27 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: a
                   <span className="text-sm font-bold">Today: {
                     myStatus.status === 'P' ? 'Present' : 
                     myStatus.status === 'A' ? 'Absent' : 
-                    myStatus.status === 'E' ? 'Excused' : 'Late'
+                    myStatus.status === 'E' ? 'Excused' : 
+                    myStatus.status === 'L' ? 'Late' : 'Other'
                   }</span>
                 </div>
-                {myStatus.reason && <p className="text-[10px] opacity-70">Reason logged</p>}
+                <Button variant="ghost" size="sm" onClick={() => handleSelfReport('-')} className="p-1 h-auto text-[10px] opacity-50 hover:opacity-100">Reset</Button>
               </div>
               {myStatus.reason && <p className="text-xs italic opacity-80">"{myStatus.reason}"</p>}
             </div>
           ) : (
             <div className="space-y-3">
-              <p className="text-xs text-slate-400">You haven't been marked for today yet.</p>
-              <Button onClick={() => setShowOut(true)} variant="outline" className="w-full border-rose-500/50 text-rose-400 hover:bg-rose-500/10">
-                <LogOut className="w-4 h-4" /> I'm Out Today
+              <p className="text-xs text-slate-400">Mark your status for today's session:</p>
+              <div className="grid grid-cols-2 gap-2">
+                <Button onClick={() => handleSelfReport('P')} variant="outline" className="border-emerald-500/50 text-emerald-400 hover:bg-emerald-500/10">
+                  <CheckSquare className="w-4 h-4" /> I'm Here
+                </Button>
+                <Button onClick={() => handleSelfReport('L')} variant="outline" className="border-amber-500/50 text-amber-400 hover:bg-amber-500/10">
+                  <Clock className="w-4 h-4" /> I'm Late
+                </Button>
+              </div>
+              <Button onClick={() => setShowOut(true)} variant="secondary" className="w-full">
+                <LogOut className="w-4 h-4" /> Log Absence
               </Button>
             </div>
           )}
@@ -752,7 +803,7 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: a
               />
               <div className="flex gap-3 justify-end">
                 <Button variant="secondary" onClick={() => setShowOut(false)}>Cancel</Button>
-                <Button onClick={handleImOut}>Submit</Button>
+                <Button onClick={() => handleSelfReport('O', outReason)}>Submit</Button>
               </div>
             </div>
           </Card>
@@ -762,14 +813,15 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: a
   );
 }
 
-function TeamsView({ teams, members, onRefresh, currentUser }: any) {
+function TeamsView({ teams, members, onRefresh, currentUser, hasScope }: any) {
   const [showAddTeam, setShowAddTeam] = useState(false);
   const [showAddMember, setShowAddMember] = useState(false);
   const [editingTeam, setEditingTeam] = useState<any>(null);
+  const [editingMember, setEditingMember] = useState<any>(null);
   const [newTeam, setNewTeam] = useState({ name: '', number: '' });
   const [newMember, setNewMember] = useState({ team_id: '', name: '', role: '', email: '', is_board: false, scopes: [] });
 
-  const isAdmin = currentUser?.role === 'President' || currentUser?.is_board;
+  const isAdmin = hasScope('admin');
 
   const handleResetPassword = async (email: string) => {
     if (!confirm(`Reset password for ${email}? They will need to set it up again on next login.`)) return;
@@ -808,12 +860,27 @@ function TeamsView({ teams, members, onRefresh, currentUser }: any) {
   };
 
   const handleAddMember = async () => {
-    await fetch('/api/members', {
-      method: 'POST',
+    const url = editingMember ? `/api/members/${editingMember.id}` : '/api/members';
+    const method = editingMember ? 'PATCH' : 'POST';
+    
+    // Robust scope handling
+    let scopes = newMember.scopes;
+    if (typeof scopes === 'string') {
+      try {
+        scopes = JSON.parse(scopes);
+      } catch {
+        scopes = [];
+      }
+    }
+
+    await fetch(url, {
+      method,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(newMember)
+      body: JSON.stringify({ ...newMember, scopes })
     });
     setShowAddMember(false);
+    setEditingMember(null);
+    setNewMember({ team_id: '', name: '', role: '', email: '', is_board: false, scopes: [] });
     onRefresh();
   };
 
@@ -898,10 +965,43 @@ function TeamsView({ teams, members, onRefresh, currentUser }: any) {
                   )}
                 </td>
                 <td className="px-6 py-4 text-xs text-slate-500">
-                  {JSON.parse(m.scopes).join(', ') || 'None'}
+                  {(() => {
+                    try {
+                      const scopes = typeof m.scopes === 'string' ? JSON.parse(m.scopes) : m.scopes;
+                      return Array.isArray(scopes) ? scopes.join(', ') : 'None';
+                    } catch {
+                      return 'None';
+                    }
+                  })()}
                 </td>
                 <td className="px-6 py-4 text-right">
                   <div className="flex justify-end gap-2">
+                    {isAdmin && (
+                      <button 
+                        onClick={() => {
+                          setEditingMember(m);
+                          let scopes = m.scopes;
+                          try {
+                            if (typeof scopes === 'string') scopes = JSON.parse(scopes);
+                          } catch {
+                            scopes = [];
+                          }
+                          setNewMember({ 
+                            team_id: m.team_id || '', 
+                            name: m.name, 
+                            role: m.role, 
+                            email: m.email, 
+                            is_board: m.is_board === 1, 
+                            scopes: Array.isArray(scopes) ? scopes : []
+                          });
+                          setShowAddMember(true);
+                        }}
+                        className="p-2 text-slate-500 hover:text-accent transition-colors"
+                        title="Edit Member"
+                      >
+                        <Edit2 className="w-4 h-4" />
+                      </button>
+                    )}
                     {isAdmin && (
                       <button 
                         onClick={() => handleResetPassword(m.email)}
@@ -946,7 +1046,7 @@ function TeamsView({ teams, members, onRefresh, currentUser }: any) {
 
       {showAddMember && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-          <Card title="Add New Member" className="w-full max-w-md">
+          <Card title={editingMember ? "Edit Member" : "Add New Member"} className="w-full max-w-md">
             <div className="space-y-4">
               <Select 
                 options={[
@@ -967,9 +1067,10 @@ function TeamsView({ teams, members, onRefresh, currentUser }: any) {
                 <div className="space-y-2">
                   <p className="text-xs text-slate-400 font-bold uppercase">Scopes</p>
                   <div className="flex flex-wrap gap-2">
-                    {['attendance', 'budget', 'tasks'].map(s => (
+                    {['attendance', 'budget', 'tasks', 'admin'].map(s => (
                       <button 
                         key={s}
+                        type="button"
                         onClick={() => {
                           const scopes = newMember.scopes.includes(s as never) 
                             ? newMember.scopes.filter(x => x !== s) 
@@ -988,8 +1089,8 @@ function TeamsView({ teams, members, onRefresh, currentUser }: any) {
                 </div>
               )}
               <div className="flex gap-3 justify-end">
-                <Button variant="secondary" onClick={() => setShowAddMember(false)}>Cancel</Button>
-                <Button onClick={handleAddMember}>Add Member</Button>
+                <Button variant="secondary" onClick={() => { setShowAddMember(false); setEditingMember(null); setNewMember({ team_id: '', name: '', role: '', email: '', is_board: false, scopes: [] }); }}>Cancel</Button>
+                <Button onClick={handleAddMember}>{editingMember ? "Save Changes" : "Add Member"}</Button>
               </div>
             </div>
           </Card>
@@ -999,138 +1100,262 @@ function TeamsView({ teams, members, onRefresh, currentUser }: any) {
   );
 }
 
-function AttendanceView({ members, attendance, onRefresh, setLoading }: any) {
-  const [selectedDate, setSelectedDate] = useState(format(new Date(), 'yyyy-MM-dd'));
+function AttendanceView({ members, attendance, onRefresh, setLoading, hasScope }: any) {
+  const [activeSubTab, setActiveSubTab] = useState<'grid' | 'history' | 'summary'>('grid');
+  const [sessions, setSessions] = useState<string[]>([]);
+  const [summary, setSummary] = useState<any[]>([]);
 
-  const getStatus = (memberId: number) => {
-    return attendance.find((r: any) => r.member_id === memberId && r.date === selectedDate)?.status || '-';
+  const isAdmin = hasScope('attendance');
+
+  useEffect(() => {
+    const fetchExtraData = async () => {
+      const [sess, summ] = await Promise.all([
+        fetch('/api/attendance/sessions').then(r => r.json()),
+        fetch('/api/attendance/summary').then(r => r.json())
+      ]);
+      if (Array.isArray(sess)) setSessions(sess);
+      if (Array.isArray(summ)) setSummary(summ);
+    };
+    fetchExtraData();
+  }, [attendance]);
+
+  const last14Days = useMemo(() => {
+    return Array.from({ length: 14 }, (_, i) => {
+      const d = new Date();
+      d.setDate(d.getDate() - (13 - i));
+      return format(d, 'yyyy-MM-dd');
+    });
+  }, []);
+
+  const getStatus = (memberId: number, date: string) => {
+    return attendance.find((r: any) => r.member_id === memberId && r.date === date)?.status || '-';
   };
 
-  const setStatus = async (memberId: number, status: string) => {
+  const toggleStatus = async (memberId: number, date: string) => {
+    if (!isAdmin) return;
+    
+    const current = getStatus(memberId, date);
+    const statuses = ['-', 'P', 'L', 'E', 'U', 'S'];
+    const nextIndex = (statuses.indexOf(current) + 1) % statuses.length;
+    const nextStatus = statuses[nextIndex];
+
     setLoading(true);
     try {
-      await fetch('/api/attendance/batch', {
+      const res = await fetch('/api/attendance/batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
-          date: selectedDate, 
-          records: [{ member_id: memberId, status: status === '-' ? null : status }] 
+          date, 
+          records: [{ member_id: memberId, status: nextStatus === '-' ? null : nextStatus }] 
         })
       });
-      onRefresh();
+      if (res.ok) {
+        onRefresh();
+      }
     } finally {
       setLoading(false);
     }
   };
 
-  const markAll = async (status: string) => {
-    setLoading(true);
-    try {
-      const records = members.map((m: any) => ({ member_id: m.id, status }));
-      await fetch('/api/attendance/batch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ date: selectedDate, records })
-      });
-      onRefresh();
-    } finally {
-      setLoading(false);
-    }
+  const statusColors: any = {
+    'P': 'bg-emerald-500 text-emerald-950',
+    'L': 'bg-amber-500 text-amber-950',
+    'E': 'bg-blue-500 text-blue-950',
+    'U': 'bg-rose-500 text-rose-950',
+    'S': 'bg-purple-500 text-purple-950',
+    '-': 'bg-white/5 text-slate-500'
   };
+
+  const renderGrid = () => (
+    <div className="glass rounded-2xl overflow-hidden">
+      <div className="overflow-x-auto">
+        <table className="w-full text-left border-collapse">
+          <thead>
+            <tr className="bg-white/5 border-b border-white/10">
+              <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase sticky left-0 bg-[#0f172a] z-10 min-w-[150px]">Member</th>
+              {last14Days.map(date => (
+                <th key={date} className="px-2 py-3 text-[10px] font-bold text-slate-400 uppercase text-center min-w-[40px]">
+                  {format(new Date(date), 'MMM dd')}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-white/5">
+            {members.map((m: any) => (
+              <tr key={m.id} className="hover:bg-white/5 transition-colors">
+                <td className="px-4 py-3 text-sm text-white font-medium sticky left-0 bg-[#0f172a]/90 backdrop-blur-md z-10 border-r border-white/5">
+                  {m.name}
+                </td>
+                {last14Days.map(date => {
+                  const status = getStatus(m.id, date);
+                  return (
+                    <td key={date} className="px-1 py-1 text-center">
+                      <button
+                        onClick={() => toggleStatus(m.id, date)}
+                        disabled={!isAdmin}
+                        className={cn(
+                          "w-8 h-8 rounded-lg flex items-center justify-center text-[10px] font-bold transition-all active:scale-90",
+                          statusColors[status] || statusColors['-'],
+                          !isAdmin && "cursor-default"
+                        )}
+                      >
+                        {status}
+                      </button>
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="p-4 bg-white/5 border-t border-white/10 flex flex-wrap gap-4 text-[10px] font-bold uppercase">
+        <div className="flex items-center gap-2"><div className="w-3 h-3 rounded bg-emerald-500" /> Present (P)</div>
+        <div className="flex items-center gap-2"><div className="w-3 h-3 rounded bg-amber-500" /> Late (L)</div>
+        <div className="flex items-center gap-2"><div className="w-3 h-3 rounded bg-blue-500" /> Excused (E)</div>
+        <div className="flex items-center gap-2"><div className="w-3 h-3 rounded bg-rose-500" /> Unexcused (U)</div>
+        <div className="flex items-center gap-2"><div className="w-3 h-3 rounded bg-purple-500" /> School Event (S)</div>
+      </div>
+    </div>
+  );
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col sm:flex-row gap-4 items-center justify-between glass p-6 rounded-2xl border border-white/10">
-        <div className="flex items-center gap-4">
-          <div className="p-3 bg-accent/20 rounded-xl text-accent">
-            <Calendar className="w-6 h-6" />
-          </div>
-          <div>
-            <h3 className="text-lg font-display font-bold text-white">Daily Attendance</h3>
-            <p className="text-xs text-slate-400">Mark who's here for the session</p>
-          </div>
-        </div>
-        <div className="flex items-center gap-3">
-          <Input 
-            type="date" 
-            className="w-48" 
-            value={selectedDate} 
-            onChange={(e: any) => setSelectedDate(e.target.value)} 
-          />
-          <div className="flex gap-2">
-            <Button size="sm" variant="secondary" onClick={() => markAll('P')}>All Present</Button>
-            <Button size="sm" variant="outline" onClick={() => markAll('A')} className="border-rose-500/50 text-rose-400">All Absent</Button>
-          </div>
-        </div>
+      <div className="flex gap-2 p-1 bg-white/5 rounded-xl border border-white/10 w-fit">
+        <button 
+          onClick={() => setActiveSubTab('grid')}
+          className={cn("px-4 py-2 rounded-lg text-sm font-bold transition-all", activeSubTab === 'grid' ? "bg-accent text-primary shadow-lg" : "text-slate-400 hover:text-white")}
+        >
+          Attendance Grid
+        </button>
+        <button 
+          onClick={() => setActiveSubTab('history')}
+          className={cn("px-4 py-2 rounded-lg text-sm font-bold transition-all", activeSubTab === 'history' ? "bg-accent text-primary shadow-lg" : "text-slate-400 hover:text-white")}
+        >
+          History
+        </button>
+        <button 
+          onClick={() => setActiveSubTab('summary')}
+          className={cn("px-4 py-2 rounded-lg text-sm font-bold transition-all", activeSubTab === 'summary' ? "bg-accent text-primary shadow-lg" : "text-slate-400 hover:text-white")}
+        >
+          Insights
+        </button>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {members.map((m: any) => {
-          const status = getStatus(m.id);
-          return (
-            <Card key={m.id} className={cn(
-              "transition-all",
-              status === 'P' ? "border-emerald-500/30 bg-emerald-500/5" :
-              status === 'A' ? "border-rose-500/30 bg-rose-500/5" :
-              "border-white/5"
-            )}>
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="font-bold text-white">{m.name}</p>
-                  <p className="text-[10px] text-slate-500 uppercase font-bold">{m.role}</p>
-                </div>
-                <div className="flex gap-1">
-                  <button 
-                    onClick={() => setStatus(m.id, 'P')}
-                    className={cn(
-                      "w-8 h-8 rounded flex items-center justify-center transition-all",
-                      status === 'P' ? "bg-emerald-500 text-primary" : "bg-white/5 text-slate-400 hover:bg-white/10"
-                    )}
-                  >
-                    P
-                  </button>
-                  <button 
-                    onClick={() => setStatus(m.id, 'A')}
-                    className={cn(
-                      "w-8 h-8 rounded flex items-center justify-center transition-all",
-                      status === 'A' ? "bg-rose-500 text-white" : "bg-white/5 text-slate-400 hover:bg-white/10"
-                    )}
-                  >
-                    A
-                  </button>
-                  <button 
-                    onClick={() => setStatus(m.id, 'L')}
-                    className={cn(
-                      "w-8 h-8 rounded flex items-center justify-center transition-all",
-                      status === 'L' ? "bg-amber-500 text-primary" : "bg-white/5 text-slate-400 hover:bg-white/10"
-                    )}
-                  >
-                    L
-                  </button>
-                  <button 
-                    onClick={() => setStatus(m.id, '-')}
-                    className="w-8 h-8 rounded flex items-center justify-center bg-white/5 text-slate-400 hover:bg-white/10"
-                  >
-                    <X className="w-4 h-4" />
-                  </button>
-                </div>
-              </div>
-            </Card>
-          );
-        })}
-      </div>
+      {activeSubTab === 'grid' && renderGrid()}
+      
+      {activeSubTab === 'history' && (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          {sessions.length === 0 ? (
+            <div className="col-span-full py-20 text-center glass rounded-2xl border border-white/5">
+              <Calendar className="w-12 h-12 text-slate-600 mx-auto mb-4" />
+              <p className="text-slate-400">No attendance history found yet.</p>
+            </div>
+          ) : (
+            sessions.map(date => {
+              const records = attendance.filter((r: any) => r.date === date);
+              const presentCount = records.filter((r: any) => r.status === 'P').length;
+              return (
+                <button 
+                  key={date}
+                  onClick={() => {
+                    // Navigate to grid or just view info
+                  }}
+                  className="glass p-4 rounded-2xl border border-white/10 text-left hover:border-accent/50 transition-all group cursor-default"
+                >
+                  <div className="flex justify-between items-start mb-3">
+                    <div className="p-2 bg-white/5 rounded-lg text-accent group-hover:bg-accent group-hover:text-primary transition-colors">
+                      <Calendar className="w-4 h-4" />
+                    </div>
+                    <span className="text-[10px] font-bold text-slate-500 uppercase">{format(new Date(date), 'EEE')}</span>
+                  </div>
+                  <p className="font-bold text-white mb-1">{format(new Date(date), 'MMM dd, yyyy')}</p>
+                  <p className="text-xs text-slate-400">{presentCount} members present</p>
+                </button>
+              );
+            })
+          )}
+        </div>
+      )}
+
+      {activeSubTab === 'summary' && (
+        <Card className="p-0 overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left">
+              <thead>
+                <tr className="bg-white/5 border-b border-white/10">
+                  <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase">Member</th>
+                  <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase">Rate</th>
+                  <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase">P / A / L / E</th>
+                  <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase">History (Last 5)</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/5">
+                {summary.map((m: any) => {
+                  const rate = m.total > 0 ? Math.round((m.present / m.total) * 100) : 0;
+                  const last5 = attendance
+                    .filter((r: any) => r.member_id === m.member_id)
+                    .sort((a, b) => b.date.localeCompare(a.date))
+                    .slice(0, 5)
+                    .reverse();
+
+                  return (
+                    <tr key={m.member_id} className="hover:bg-white/[0.02] transition-colors">
+                      <td className="px-6 py-4">
+                        <p className="font-bold text-white">{m.name}</p>
+                        <p className="text-[10px] text-slate-500 uppercase">{members.find((mem: any) => mem.id === m.member_id)?.role}</p>
+                      </td>
+                      <td className="px-6 py-4">
+                        <div className="flex items-center gap-3">
+                          <div className="w-12 h-1.5 bg-white/5 rounded-full overflow-hidden">
+                            <div className="h-full bg-accent" style={{ width: `${rate}%` }} />
+                          </div>
+                          <span className="text-sm font-bold text-white">{rate}%</span>
+                        </div>
+                      </td>
+                      <td className="px-6 py-4">
+                        <div className="flex gap-2">
+                          <span className="text-xs font-bold text-emerald-400" title="Present">{m.present}P</span>
+                          <span className="text-xs font-bold text-rose-400" title="Absent">{m.absent}A</span>
+                          <span className="text-xs font-bold text-amber-400" title="Late">{m.late}L</span>
+                          <span className="text-xs font-bold text-blue-400" title="Excused">{m.excused}E</span>
+                        </div>
+                      </td>
+                      <td className="px-6 py-4">
+                        <div className="flex gap-1">
+                          {last5.map((r, i) => (
+                            <div 
+                              key={i} 
+                              className={cn(
+                                "w-2 h-2 rounded-full",
+                                statusColors[r.status] || 'bg-slate-700'
+                              )}
+                              title={`${r.date}: ${r.status}`}
+                            />
+                          ))}
+                          {last5.length === 0 && <span className="text-[10px] text-slate-600">No data</span>}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
     </div>
   );
 }
 
-function TasksView({ tasks, teams, members, onRefresh, currentUser }: any) {
+function TasksView({ tasks, teams, members, onRefresh, currentUser, hasScope }: any) {
   const [showAddTask, setShowAddTask] = useState(false);
   const [showAnalytics, setShowAnalytics] = useState(false);
   const [isBoardTask, setIsBoardTask] = useState(false);
   const [newTask, setNewTask] = useState({ team_id: '', title: '', description: '', assigned_to: '', due_date: '' });
   const [filterTeam, setFilterTeam] = useState('all');
 
-  const isAdmin = currentUser?.role === 'President' || currentUser?.is_board;
+  const isAdmin = hasScope('admin');
 
   const handleAddTask = async () => {
     await fetch('/api/tasks', {
@@ -1380,7 +1605,7 @@ function TasksView({ tasks, teams, members, onRefresh, currentUser }: any) {
   );
 }
 
-function BudgetView({ budget, teams, onRefresh }: any) {
+function BudgetView({ budget, teams, onRefresh, hasScope }: any) {
   const [showAdd, setShowAdd] = useState(false);
   const [newItem, setNewItem] = useState({ team_id: '', type: 'expense', amount: '', category: '', description: '', date: format(new Date(), 'yyyy-MM-dd') });
 
@@ -1403,6 +1628,8 @@ function BudgetView({ budget, teams, onRefresh }: any) {
   const totalIncome = budget.filter((i: any) => i.type === 'income').reduce((acc: number, i: any) => acc + i.amount, 0);
   const totalExpense = budget.filter((i: any) => i.type === 'expense').reduce((acc: number, i: any) => acc + i.amount, 0);
 
+  const isAdmin = hasScope('budget');
+
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -1422,7 +1649,7 @@ function BudgetView({ budget, teams, onRefresh }: any) {
 
       <div className="flex items-center justify-between">
         <h3 className="text-xl font-display font-bold text-white">Transaction History</h3>
-        <Button onClick={() => setShowAdd(true)}><Plus className="w-4 h-4" /> Log Transaction</Button>
+        {isAdmin && <Button onClick={() => setShowAdd(true)}><Plus className="w-4 h-4" /> Log Transaction</Button>}
       </div>
 
       <div className="glass rounded-2xl overflow-hidden">
@@ -1449,9 +1676,11 @@ function BudgetView({ budget, teams, onRefresh }: any) {
                   {item.type === 'income' ? '+' : '-'}${item.amount.toLocaleString()}
                 </td>
                 <td className="px-6 py-4 text-right">
-                  <button onClick={() => handleDelete(item.id)} className="text-slate-600 hover:text-rose-400 transition-colors">
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                  {isAdmin && (
+                    <button onClick={() => handleDelete(item.id)} className="text-slate-600 hover:text-rose-400 transition-colors">
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  )}
                 </td>
               </tr>
             ))}
@@ -1812,6 +2041,108 @@ function ChatView({ messages, members, currentUser, socket }: any) {
   );
 }
 
+function ProfileView({ currentUser, onRefresh, setLoading, hasScope }: any) {
+  const [name, setName] = useState(currentUser?.name || '');
+  const [role, setRole] = useState(currentUser?.role || '');
+
+  const handleSave = async () => {
+    setLoading(true);
+    try {
+      // Ensure we send scopes as an array
+      let currentScopes = currentUser.scopes;
+      try {
+        while (typeof currentScopes === 'string') {
+          const parsed = JSON.parse(currentScopes);
+          if (typeof parsed === 'string') currentScopes = parsed;
+          else { currentScopes = parsed; break; }
+        }
+      } catch {
+        currentScopes = [];
+      }
+
+      const res = await fetch(`/api/members/${currentUser.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...currentUser, name, role, scopes: currentScopes })
+      });
+      if (res.ok) {
+        onRefresh();
+        alert('Profile updated successfully!');
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleFullPower = async () => {
+    setLoading(true);
+    try {
+      const allScopes = ['attendance', 'budget', 'tasks', 'admin'];
+      const res = await fetch(`/api/members/${currentUser.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...currentUser, scopes: allScopes })
+      });
+      if (res.ok) {
+        onRefresh();
+        alert('All scopes granted! You have full power.');
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const isAdmin = hasScope('admin');
+
+  return (
+    <div className="max-w-2xl space-y-6">
+      <h3 className="text-xl font-display font-bold text-white">My Profile</h3>
+      <Card title="Personal Information" icon={UserCircle}>
+        <div className="space-y-4">
+          <div className="space-y-1">
+            <label className="text-xs font-bold text-slate-400 uppercase">Full Name</label>
+            <Input value={name} onChange={(e: any) => setName(e.target.value)} />
+          </div>
+          <div className="space-y-1">
+            <label className="text-xs font-bold text-slate-400 uppercase">Role / Description</label>
+            <Input value={role} onChange={(e: any) => setRole(e.target.value)} />
+          </div>
+          <div className="pt-2 flex gap-3">
+            <Button onClick={handleSave}>Save Changes</Button>
+            {isAdmin && (
+              <Button variant="outline" onClick={handleFullPower} className="border-accent text-accent hover:bg-accent/10">
+                <Zap className="w-4 h-4" /> Full Admin Power
+              </Button>
+            )}
+          </div>
+        </div>
+      </Card>
+      
+      <Card title="Account Details" className="opacity-70">
+        <div className="space-y-2">
+          <p className="text-sm text-slate-400">Email: <span className="text-white">{currentUser?.email}</span></p>
+          <p className="text-sm text-slate-400">Account Type: <span className="text-accent">{currentUser?.is_board ? 'Board Member' : 'Team Member'}</span></p>
+          <p className="text-sm text-slate-400">Administrative Scopes: <span className="text-white">
+            {(() => {
+              try {
+                let scopes = currentUser?.scopes;
+                while (typeof scopes === 'string') {
+                  const parsed = JSON.parse(scopes);
+                  if (typeof parsed === 'string') scopes = parsed;
+                  else { scopes = parsed; break; }
+                }
+                return Array.isArray(scopes) && scopes.length > 0 ? scopes.join(', ') : 'None';
+              } catch {
+                return 'None';
+              }
+            })()}
+          </span></p>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
 function SettingsView({ settings, members, onRefresh, currentUser }: any) {
   const [criteria, setCriteria] = useState(settings.excuse_criteria || '');
   const [showMemberEdit, setShowMemberEdit] = useState<any>(null);
@@ -1883,7 +2214,14 @@ function SettingsView({ settings, members, onRefresh, currentUser }: any) {
                         </button>
                       </td>
                       <td className="px-4 py-3 text-xs text-slate-500">
-                        {JSON.parse(m.scopes).join(', ') || 'None'}
+                        {(() => {
+                          try {
+                            const scopes = typeof m.scopes === 'string' ? JSON.parse(m.scopes) : m.scopes;
+                            return Array.isArray(scopes) ? scopes.join(', ') : 'None';
+                          } catch {
+                            return 'None';
+                          }
+                        })()}
                       </td>
                       <td className="px-4 py-3 text-right">
                         <Button variant="secondary" size="sm" onClick={() => setShowMemberEdit(m)}>Edit Scopes</Button>
@@ -1903,14 +2241,21 @@ function SettingsView({ settings, members, onRefresh, currentUser }: any) {
             <div className="space-y-4">
               <div className="flex flex-wrap gap-2">
                 {['attendance', 'budget', 'tasks', 'admin'].map(s => {
-                  const currentScopes = JSON.parse(showMemberEdit.scopes);
+                  const currentScopes = (() => {
+                    try {
+                      const parsed = typeof showMemberEdit.scopes === 'string' ? JSON.parse(showMemberEdit.scopes) : showMemberEdit.scopes;
+                      return Array.isArray(parsed) ? parsed : [];
+                    } catch {
+                      return [];
+                    }
+                  })();
                   const active = currentScopes.includes(s);
                   return (
                     <button 
                       key={s}
                       onClick={() => {
                         const next = active ? currentScopes.filter((x: string) => x !== s) : [...currentScopes, s];
-                        setShowMemberEdit({ ...showMemberEdit, scopes: JSON.stringify(next) });
+                        setShowMemberEdit({ ...showMemberEdit, scopes: next });
                       }}
                       className={cn(
                         "px-3 py-1 rounded-full text-[10px] font-bold uppercase border transition-all",

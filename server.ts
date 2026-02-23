@@ -12,7 +12,7 @@ const __dirname = path.dirname(__filename);
 
 const db = new Database("nexus.db");
 
-// Initialize Database
+// Initialize Database - Create all tables first
 db.exec(`
   CREATE TABLE IF NOT EXISTS teams (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,32 +33,21 @@ db.exec(`
     FOREIGN KEY(team_id) REFERENCES teams(id)
   );
 
-  -- Migration: Add password and is_setup if they don't exist (for existing DBs)
-  PRAGMA table_info(members);
-`);
+  CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    team_id INTEGER,
+    assigned_to INTEGER,
+    title TEXT NOT NULL,
+    description TEXT,
+    status TEXT DEFAULT 'todo', -- 'todo', 'in-progress', 'done'
+    due_date TEXT,
+    is_board INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT,
+    FOREIGN KEY(team_id) REFERENCES teams(id),
+    FOREIGN KEY(assigned_to) REFERENCES members(id)
+  );
 
-// Check for missing columns manually since PRAGMA doesn't work in exec for conditional logic easily
-const columns = db.prepare("PRAGMA table_info(members)").all();
-const hasPassword = columns.some((c: any) => c.name === 'password');
-const hasIsSetup = columns.some((c: any) => c.name === 'is_setup');
-
-if (!hasPassword) {
-  db.exec("ALTER TABLE members ADD COLUMN password TEXT");
-}
-if (!hasIsSetup) {
-  db.exec("ALTER TABLE members ADD COLUMN is_setup INTEGER DEFAULT 0");
-}
-
-// Migration: Add is_board to tasks
-const taskColumns = db.prepare("PRAGMA table_info(tasks)").all();
-if (!taskColumns.some((c: any) => c.name === 'is_board')) {
-  db.exec("ALTER TABLE tasks ADD COLUMN is_board INTEGER DEFAULT 0");
-}
-
-// Migration: Add unique index to attendance for INSERT OR REPLACE
-db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_member_date ON attendance(member_id, date)");
-
-db.exec(`
   CREATE TABLE IF NOT EXISTS attendance (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     member_id INTEGER,
@@ -95,24 +84,6 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
-  );
-
-  -- Initial settings
-  INSERT OR IGNORE INTO settings (key, value) VALUES ('excuse_criteria', 'Excused if for school, family emergency, or illness. Unexcused for gaming, hanging out, or forgetting.');
-
-  CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    team_id INTEGER,
-    title TEXT NOT NULL,
-    description TEXT,
-    status TEXT DEFAULT 'todo', -- 'todo', 'in-progress', 'done'
-    assigned_to INTEGER,
-    due_date TEXT,
-    created_at TEXT NOT NULL,
-    completed_at TEXT,
-    is_board INTEGER DEFAULT 0,
-    FOREIGN KEY(team_id) REFERENCES teams(id),
-    FOREIGN KEY(assigned_to) REFERENCES members(id)
   );
 
   CREATE TABLE IF NOT EXISTS documentation (
@@ -153,6 +124,27 @@ db.exec(`
     date TEXT NOT NULL,
     type TEXT DEFAULT 'email' -- 'email', 'announcement'
   );
+`);
+
+// Migrations - Handle structural updates for existing databases
+const memberColumns = db.prepare("PRAGMA table_info(members)").all();
+if (!memberColumns.some((c: any) => c.name === 'password')) {
+  db.exec("ALTER TABLE members ADD COLUMN password TEXT");
+}
+if (!memberColumns.some((c: any) => c.name === 'is_setup')) {
+  db.exec("ALTER TABLE members ADD COLUMN is_setup INTEGER DEFAULT 0");
+}
+
+const taskColumns = db.prepare("PRAGMA table_info(tasks)").all();
+if (!taskColumns.some((c: any) => c.name === 'is_board')) {
+  db.exec("ALTER TABLE tasks ADD COLUMN is_board INTEGER DEFAULT 0");
+}
+
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_member_date ON attendance(member_id, date)");
+
+// Initial data
+db.exec(`
+  INSERT OR IGNORE INTO settings (key, value) VALUES ('excuse_criteria', 'Excused if for school, family emergency, or illness. Unexcused for gaming, hanging out, or forgetting.');
 `);
 
 async function startServer() {
@@ -298,15 +290,17 @@ async function startServer() {
 
   app.post("/api/members", (req, res) => {
     const { team_id, name, role, email, is_board, scopes } = req.body;
+    const finalScopes = typeof scopes === 'string' ? scopes : JSON.stringify(scopes || []);
     const info = db.prepare("INSERT INTO members (team_id, name, role, email, is_board, scopes) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(team_id, name, role, email, is_board ? 1 : 0, JSON.stringify(scopes || []));
+      .run(team_id, name, role, email, is_board ? 1 : 0, finalScopes);
     res.json({ id: info.lastInsertRowid });
   });
 
   app.patch("/api/members/:id", (req, res) => {
     const { team_id, name, role, email, is_board, scopes } = req.body;
+    const finalScopes = typeof scopes === 'string' ? scopes : JSON.stringify(scopes || []);
     db.prepare("UPDATE members SET team_id = ?, name = ?, role = ?, email = ?, is_board = ?, scopes = ? WHERE id = ?")
-      .run(team_id, name, role, email, is_board ? 1 : 0, JSON.stringify(scopes || []), req.params.id);
+      .run(team_id, name, role, email, is_board ? 1 : 0, finalScopes, req.params.id);
     res.json({ success: true });
   });
 
@@ -340,7 +334,15 @@ async function startServer() {
         return res.status(400).json({ error: "Invalid request body" });
       }
 
-      const insert = db.prepare("INSERT OR REPLACE INTO attendance (member_id, date, status, reason) VALUES (?, ?, ?, ?)");
+      console.log(`[Attendance] Updating ${records.length} records for ${date}`);
+
+      const insert = db.prepare(`
+        INSERT INTO attendance (member_id, date, status, reason) 
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(member_id, date) DO UPDATE SET
+          status = excluded.status,
+          reason = COALESCE(excluded.reason, attendance.reason)
+      `);
       const deleteStmt = db.prepare("DELETE FROM attendance WHERE member_id = ? AND date = ?");
       
       const transaction = db.transaction((data) => {
@@ -357,6 +359,42 @@ async function startServer() {
       res.json({ success: true });
     } catch (error) {
       console.error("Error in attendance batch:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  app.get("/api/attendance/summary", (req, res) => {
+    try {
+      const summary = db.prepare(`
+        SELECT 
+          m.id as member_id, 
+          m.name,
+          COUNT(CASE WHEN a.status = 'P' THEN 1 END) as present,
+          COUNT(CASE WHEN a.status = 'A' THEN 1 END) as absent,
+          COUNT(CASE WHEN a.status = 'L' THEN 1 END) as late,
+          COUNT(CASE WHEN a.status = 'E' THEN 1 END) as excused,
+          COUNT(a.id) as total
+        FROM members m
+        LEFT JOIN attendance a ON m.id = a.member_id
+        GROUP BY m.id
+      `).all();
+      res.json(summary);
+    } catch (error) {
+      console.error("Error fetching attendance summary:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  app.get("/api/attendance/sessions", (req, res) => {
+    try {
+      const sessions = db.prepare(`
+        SELECT DISTINCT date 
+        FROM attendance 
+        ORDER BY date DESC
+      `).all();
+      res.json(sessions.map((s: any) => s.date));
+    } catch (error) {
+      console.error("Error fetching attendance sessions:", error);
       res.status(500).json({ error: "Internal server error" });
     }
   });
@@ -514,7 +552,7 @@ async function startServer() {
       // Notify board members of budget changes
       const boardMembers = db.prepare("SELECT id FROM members WHERE is_board = 1").all();
       boardMembers.forEach((m: any) => {
-        createNotification(m.id, `New budget ${type}: $${amount} for ${category}`, 'system');
+        createNotification(m.id, `New budget ${type}: $$${amount} for ${category}`, 'system');
       });
 
       res.json({ id: info.lastInsertRowid });
