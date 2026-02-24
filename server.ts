@@ -1,11 +1,136 @@
 import express from "express";
+import "dotenv/config";
 import { createServer as createViteServer } from "vite";
 import Database from "better-sqlite3";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
 import bcrypt from "bcryptjs";
+
+// configuration tweaks for temporary behavior
+// set this to true when you want to turn off the news endpoint
+const NEWS_DISABLED = false;
+
+const EXA_API_KEY = process.env.EXA_API_KEY;
+console.log("EXA_API_KEY present:", !!EXA_API_KEY);
+
+async function searchExa(query: string) {
+  if (!EXA_API_KEY) {
+    console.warn("EXA_API_KEY not found, falling back to basic prompt.");
+    return null;
+  }
+  
+  try {
+    const response = await fetch('https://api.exa.ai/search', {
+      method: 'POST',
+      headers: {
+        'x-api-key': EXA_API_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        query: query,
+        category: "news",
+        type: "auto",
+        num_results: 5,
+        contents: {
+          highlights: {
+            max_characters: 1000
+          }
+        }
+      })
+    });
+
+    if (!response.ok) {
+      console.error("Exa API error:", response.status, response.statusText);
+      return null;
+    }
+
+    const data: any = await response.json();
+    return data.results.map((r: any) => ({
+      title: r.title,
+      url: r.url,
+      highlight: r.highlights?.[0] || ""
+    }));
+  } catch (error) {
+    console.error("Error calling Exa:", error);
+    return null;
+  }
+}
+// default maximum tokens to generate for any request; can also be overridden via env
+const DEFAULT_MAX_TOKENS = parseInt(process.env.MAX_TOKENS_LIMIT || '1024', 10);
+
+const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'phi3.5';
+
+async function callOllama(prompt: string, stream: boolean, onChunk?: (chunk: string) => void) {
+  const response = await fetch(OLLAMA_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: OLLAMA_MODEL,
+      prompt: prompt,
+      stream: stream,
+      options: {
+        num_predict: DEFAULT_MAX_TOKENS
+      }
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Ollama error: ${response.statusText}`);
+  }
+
+  if (stream) {
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+    if (!reader) return;
+
+    let buffer = '';
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        
+        if (value) {
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const json = JSON.parse(line);
+              if (json.response) {
+                onChunk?.(json.response);
+              }
+              if (json.done) return;
+            } catch (e) {
+              console.error('Error parsing Ollama chunk:', e);
+            }
+          }
+        }
+
+        if (done) {
+          if (buffer.trim()) {
+            try {
+              const json = JSON.parse(buffer);
+              if (json.response) onChunk?.(json.response);
+            } catch (e) {
+              // ignore partial
+            }
+          }
+          break;
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  } else {
+    const json: any = await response.json();
+    return json.response;
+  }
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -639,6 +764,144 @@ async function startServer() {
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  // --- AI endpoints using the local llama model ---
+
+  app.post("/api/ai/fetch-news", async (req, res) => {
+    try {
+      // temporarily disabled? respond with static message
+      if (NEWS_DISABLED) {
+        const msg = "News service is currently disabled.";
+        if (req.query.stream === 'true') {
+          res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+          res.setHeader('Transfer-Encoding', 'chunked');
+          res.setHeader('Cache-Control', 'no-cache');
+          res.setHeader('Connection', 'keep-alive');
+          res.flushHeaders();
+          res.write(msg);
+          res.end();
+          return;
+        } else {
+          return res.json({ result: msg });
+        }
+      }
+
+      const { stream } = req.query;
+      
+      // 1. Search Exa for fresh info
+      const searchResults = await searchExa("latest FIRST Tech Challenge (FTC) robotics news and updates");
+      
+      let prompt = "Search for the latest FIRST Tech Challenge (FTC) news, REV Robotics updates, and interesting engineering tips for robotics teams. Summarize the top 5 most relevant items for a high school robotics club. Include links if possible.";
+      
+      if (searchResults && searchResults.length > 0) {
+        const context = searchResults.map(r => `Title: ${r.title}\nURL: ${r.url}\nSummary: ${r.highlight}`).join("\n\n");
+        prompt = `Based on these recent search results from Exa, summarize the top 5 most relevant FTC/Robotics news items for a high school club. Include links to the sources.\n\nSearch Results:\n${context}`;
+      }
+
+      if (stream === 'true') {
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Transfer-Encoding', 'chunked');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders();
+
+        await callOllama(prompt, true, (chunk) => {
+          res.write(chunk);
+        });
+        res.end();
+      } else {
+        const response = await callOllama(prompt, false);
+        res.json({ result: response });
+      }
+    } catch (error) {
+      console.error("Error AI fetching news:", error);
+      res.status(500).json({ error: "AI error" });
+    }
+  });
+
+  app.post("/api/ai/attendance", async (req, res) => {
+    try {
+      const { records, members } = req.body;
+      const data = JSON.stringify({ records, members });
+      const prompt =
+        `Analyze this attendance data for a robotics club and provide 3 key insights or suggestions for the leadership team. Keep it concise.\n\nData: ${data}`;
+
+      if (req.query.stream === 'true') {
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Transfer-Encoding', 'chunked');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders();
+        await callOllama(prompt, true, (chunk) => {
+          res.write(chunk);
+        });
+        res.end();
+      } else {
+        const response = await callOllama(prompt, false);
+        res.json({ result: response });
+      }
+    } catch (error) {
+      console.error("Error AI attendance insights:", error);
+      res.status(500).json({ error: "AI error" });
+    }
+  });
+
+  app.post("/api/ai/check-excuse", async (req, res) => {
+    try {
+      const { reason, criteria } = req.body;
+      const prompt =
+        `Based on these criteria: "${criteria}", is the following reason for absence excused? ` +
+        `Respond with "EXCUSED" or "UNEXCUSED" followed by a very brief explanation.\n\nReason: "${reason}"`;
+
+      if (req.query.stream === 'true') {
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Transfer-Encoding', 'chunked');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders();
+        await callOllama(prompt, true, (chunk) => {
+          res.write(chunk);
+        });
+        res.end();
+      } else {
+        const response = await callOllama(prompt, false);
+        res.json({ result: response });
+      }
+    } catch (error) {
+      console.error("Error AI excuse check:", error);
+      res.status(500).json({ error: "AI error" });
+    }
+  });
+
+  app.post("/api/ai/activity-summary", async (req, res) => {
+    try {
+      const { tasks, messages, budget, userScope } = req.body;
+      const payload = JSON.stringify({ tasks, messages, budget });
+      const prompt =
+        `Provide a concise executive summary of the recent club activity based on the following data. ` +
+        `The user viewing this has the following role/scope: ${JSON.stringify(userScope)}. ` +
+        `Only include information that would be relevant or accessible to someone with this scope. ` +
+        `Highlight progress, concerns, and upcoming deadlines. Keep it professional and scannable.\n\nData: ${payload}`;
+
+      if (req.query.stream === 'true') {
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Transfer-Encoding', 'chunked');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders();
+        await callOllama(prompt, true, (chunk) => {
+          res.write(chunk);
+        });
+        res.end();
+      } else {
+        const response = await callOllama(prompt, false);
+        res.json({ result: response });
+      }
+    } catch (error) {
+      console.error("Error AI activity summary:", error);
+      res.status(500).json({ error: "AI error" });
     }
   });
   app.get("/api/communications", (req, res) => {

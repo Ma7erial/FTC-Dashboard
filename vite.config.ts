@@ -5,19 +5,9 @@ import fs from 'fs';
 import {defineConfig, loadEnv} from 'vite';
 
 export default defineConfig(({mode}) => {
-  const env = loadEnv(mode, '.', '');
-  
-  // Try to load API key from file if not in env
-  let apiKey = env.GEMINI_API_KEY || env.VITE_GEMINI_API_KEY;
-  if (!apiKey && fs.existsSync('api.key')) {
-    apiKey = fs.readFileSync('api.key', 'utf-8').trim();
-  }
-
+  // environment variables are no longer needed for the AI client
   return {
     plugins: [react(), tailwindcss()],
-    define: {
-      'process.env.GEMINI_API_KEY': JSON.stringify(apiKey),
-    },
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
