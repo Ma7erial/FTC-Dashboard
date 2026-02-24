@@ -42,11 +42,10 @@ import {
   BarChart, Bar, Cell, PieChart, Pie
 } from 'recharts';
 import Markdown from 'react-markdown';
-import { GoogleGenAI, Type } from "@google/genai";
 import { format } from 'date-fns';
 
 import { Team, Member, AttendanceRecord, Task, BudgetItem, OutreachEvent, Communication } from './types';
-import { fetchFTCNews, getAttendanceInsights, checkExcuse, getActivitySummary } from './services/geminiService';
+import { fetchFTCNews, streamFTCNews, getAttendanceInsights, streamAttendanceInsights, checkExcuse, streamCheckExcuse, getActivitySummary, streamActivitySummary } from './services/aiService';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -147,6 +146,41 @@ export default function App() {
   const [summary, setSummary] = useState<string>("");
   const [loading, setLoading] = useState(false);
 
+  // helper that uses our service; can force a refresh bypassing the 24h cache
+  // this implementation streams the response so the UI updates as tokens arrive
+  const updateNews = async (force: boolean = false) => {
+    const CACHE_KEY = 'ftcNewsCache';
+    const TS_KEY = 'ftcNewsTimestamp';
+
+    // check local cache first
+    if (!force && typeof localStorage !== 'undefined') {
+      const cached = localStorage.getItem(CACHE_KEY);
+      const ts = localStorage.getItem(TS_KEY);
+      if (cached && ts) {
+        const age = Date.now() - parseInt(ts, 10);
+        if (age < 24 * 60 * 60 * 1000) {
+          setNews(cached);
+          return;
+        }
+      }
+    }
+
+    try {
+      let aggregate = '';
+      await streamFTCNews(force, (chunk) => {
+        aggregate += chunk;
+        setNews(aggregate);
+      });
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(CACHE_KEY, aggregate);
+        localStorage.setItem(TS_KEY, Date.now().toString());
+      }
+    } catch (err) {
+      console.error('Error updating news:', err);
+      setNews('Failed to fetch latest news. Please check your connection.');
+    }
+  };
+
   // WebSocket
   const [socket, setSocket] = useState<WebSocket | null>(null);
 
@@ -192,6 +226,21 @@ export default function App() {
     };
 
     setSocket(ws);
+  };
+
+  const updateInsights = async () => {
+    if (attendance.length === 0 || members.length === 0) return;
+    setInsights("");
+    let aggInsights = '';
+    try {
+      await streamAttendanceInsights(attendance, members, (chunk) => {
+        aggInsights += chunk;
+        setInsights(aggInsights);
+      });
+    } catch (err) {
+      console.error('Error updating insights:', err);
+      setInsights('Failed to generate insights.');
+    }
   };
 
   const fetchData = async () => {
@@ -252,17 +301,19 @@ export default function App() {
       }
 
       // Background updates
-      fetchFTCNews().then(res => res && setNews(res));
-      if (a && a.length > 0 && m) {
-        getAttendanceInsights(a, m).then(res => res && setInsights(res));
-      }
+      updateNews();
+      // Insights and Summary are now manual or context-specific
       if (currentUser) {
-        getActivitySummary({ 
+        let aggSummary = '';
+        streamActivitySummary({ 
           tasks: tk, 
           messages: msgs, 
           budget: b,
           userScope: { role: currentUser.role, is_board: currentUser.is_board, scopes: currentUser.scopes }
-        }).then(res => res && setSummary(res));
+        }, (chunk) => {
+          aggSummary += chunk;
+          setSummary(aggSummary);
+        });
       }
     } catch (err) {
       console.error("Error in fetchData:", err);
@@ -379,7 +430,10 @@ export default function App() {
     const viewProps = {
       teams, members, attendance, tasks, budget, outreach, communications, 
       messages, settings, hiddenDates, currentUser, onRefresh: fetchData, setLoading,
-      insights, news, summary, socket, hasScope
+      insights, news, summary, socket, hasScope,
+      // give child views a way to explicitly refresh the AI news cache
+      refreshNews: () => updateNews(true),
+      updateInsights
     };
     switch (activeTab) {
       case 'dashboard': return <DashboardView {...viewProps} data={{ attendance, tasks, budget, outreach, insights, news, summary, members }} />;
@@ -622,7 +676,7 @@ export default function App() {
 
 // --- View Components ---
 
-function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: any) {
+function DashboardView({ data, currentUser, onRefresh, settings, setLoading, insights, updateInsights }: any) {
   const [showOut, setShowOut] = useState(false);
   const [outReason, setOutReason] = useState('');
 
@@ -636,10 +690,11 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: a
       let aiNote = '';
       
       if (status === 'O' && reason) {
-        const excuseResult = await checkExcuse(reason, settings.excuse_criteria);
-        const isExcused = excuseResult.includes("EXCUSED");
+        await streamCheckExcuse(reason, settings.excuse_criteria, (chunk) => {
+          aiNote += chunk;
+        });
+        const isExcused = aiNote.toUpperCase().includes("EXCUSED") && !aiNote.toUpperCase().includes("UNEXCUSED");
         finalStatus = isExcused ? 'E' : 'U';
-        aiNote = excuseResult;
       }
 
       const res = await fetch('/api/attendance/batch', {
@@ -686,7 +741,7 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: a
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 pb-20">
-      <Card title="Club Health" icon={TrendingUp} className="lg:col-span-2">
+      <Card title="Club Health" icon={TrendingUp} className="lg:col-span-3">
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div className="p-4 bg-white/5 rounded-2xl border border-white/5">
             <p className="text-xs text-slate-400 uppercase font-bold mb-1">Attendance {todayAttendance.length > 0 ? '(Today)' : '(Avg)'}</p>
@@ -702,7 +757,7 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: a
           </div>
         </div>
         
-        <div className="mt-6 h-64 min-h-[250px]">
+        <div className="mt-6 h-64 min-h-[250px] w-full">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={chartData}>
               <CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" vertical={false} />
@@ -716,11 +771,24 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading }: a
             </LineChart>
           </ResponsiveContainer>
         </div>
-      </Card>
 
-      <Card title="AI Insights" icon={Clock} className="h-full">
-        <div className="text-sm text-slate-300 leading-relaxed prose prose-invert h-[300px] lg:h-[400px] overflow-y-auto custom-scrollbar pr-2">
-          <Markdown>{data.insights || "Analyzing club data for insights..."}</Markdown>
+        <div className="mt-8 pt-8 border-t border-white/5">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <Zap className="w-5 h-5 text-accent" />
+              <h4 className="text-sm font-bold text-white uppercase tracking-wider">Attendance Insights</h4>
+            </div>
+            <Button variant="outline" size="sm" onClick={() => updateInsights()}>
+              <Zap className="w-3 h-3 mr-1" /> {insights ? "Refresh Insights" : "Generate Insights"}
+            </Button>
+          </div>
+          <div className="text-sm text-slate-300 leading-relaxed prose prose-invert max-w-none">
+            {insights ? (
+              <Markdown>{insights}</Markdown>
+            ) : (
+              <p className="text-xs text-slate-500 italic">Click generate to analyze attendance patterns and club health.</p>
+            )}
+          </div>
         </div>
       </Card>
 
@@ -1100,7 +1168,7 @@ function TeamsView({ teams, members, onRefresh, currentUser, hasScope }: any) {
   );
 }
 
-function AttendanceView({ members, attendance, onRefresh, setLoading, hasScope }: any) {
+function AttendanceView({ members, attendance, onRefresh, setLoading, hasScope, insights, updateInsights }: any) {
   const [activeSubTab, setActiveSubTab] = useState<'grid' | 'history' | 'summary'>('grid');
   const [sessions, setSessions] = useState<string[]>([]);
   const [summary, setSummary] = useState<any[]>([]);
@@ -1279,7 +1347,22 @@ function AttendanceView({ members, attendance, onRefresh, setLoading, hasScope }
       )}
 
       {activeSubTab === 'summary' && (
-        <Card className="p-0 overflow-hidden">
+        <div className="space-y-6">
+          <Card title="Attendance Analysis" icon={Zap}>
+            <div className="flex items-center justify-between mb-4">
+              <p className="text-sm text-slate-400">Leverage AI to identify trends, missing members, and engagement levels.</p>
+              <Button onClick={() => updateInsights()}>
+                <Zap className="w-4 h-4" /> {insights ? "Refresh Analysis" : "Generate Analysis"}
+              </Button>
+            </div>
+            {insights && (
+              <div className="p-6 bg-white/5 rounded-2xl border border-white/10 prose prose-invert max-w-none">
+                <Markdown>{insights}</Markdown>
+              </div>
+            )}
+          </Card>
+
+          <Card className="p-0 overflow-hidden">
           <div className="overflow-x-auto">
             <table className="w-full text-left">
               <thead>
@@ -1343,6 +1426,7 @@ function AttendanceView({ members, attendance, onRefresh, setLoading, hasScope }
             </table>
           </div>
         </Card>
+        </div>
       )}
     </div>
   );
@@ -1456,7 +1540,7 @@ function TasksView({ tasks, teams, members, onRefresh, currentUser, hasScope }: 
       {showAnalytics ? (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <Card title="Completion Trend (Last 7 Days)" icon={TrendingUp}>
-            <div className="h-64 mt-4">
+            <div className="h-64 min-h-[250px] w-full mt-4">
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={completionTrends}>
                   <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
@@ -1473,7 +1557,7 @@ function TasksView({ tasks, teams, members, onRefresh, currentUser, hasScope }: 
           </Card>
 
           <Card title="Member Capacity" icon={Users}>
-            <div className="h-64 mt-4">
+            <div className="h-64 min-h-[250px] w-full mt-4">
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={memberCapacity} layout="vertical">
                   <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
@@ -1801,12 +1885,12 @@ function OutreachView({ outreach, onRefresh }: any) {
   );
 }
 
-function ScoutView({ news, onRefresh }: any) {
+function ScoutView({ news, refreshNews }: any) {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h3 className="text-xl font-display font-bold text-white">AI Scout: FTC & REV News</h3>
-        <Button onClick={onRefresh} variant="outline"><Clock className="w-4 h-4" /> Refresh News</Button>
+        <Button onClick={refreshNews} variant="outline"><Clock className="w-4 h-4" /> Refresh News</Button>
       </div>
 
       <Card className="min-h-[500px]">
@@ -2173,7 +2257,7 @@ function SettingsView({ settings, members, onRefresh, currentUser }: any) {
     <div className="max-w-4xl space-y-8">
       <Card title="AI Absence Evaluation" icon={Settings}>
         <div className="space-y-4">
-          <p className="text-sm text-slate-400">Define the criteria Gemini should use to determine if an absence is excused.</p>
+          <p className="text-sm text-slate-400">Define the criteria the AI should use to determine if an absence is excused.</p>
           <textarea 
             className="w-full bg-primary border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-accent/50 transition-colors h-48 text-sm"
             placeholder="e.g. Excused if: sick with doctor note, family emergency, school event. Unexcused if: forgot, overslept, gaming..."
