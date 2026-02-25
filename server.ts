@@ -984,7 +984,9 @@ async function startServer() {
   app.get("/api/admin/storage-usage", (req, res) => {
     try {
       const messageFilesSize = db.prepare("SELECT SUM(file_size) as total FROM messages WHERE file_size IS NOT NULL").get() as any;
+      console.log("messageFilesSize raw:", messageFilesSize);
       const codeFilesSize = db.prepare("SELECT SUM(file_size) as total FROM code_files WHERE file_size IS NOT NULL").get() as any;
+      console.log("codeFilesSize raw:", codeFilesSize);
       
       const totalSize = (messageFilesSize?.total || 0) + (codeFilesSize?.total || 0);
       
