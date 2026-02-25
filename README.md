@@ -1,4 +1,4 @@
-# FTC Nexus Dashboard
+# FTC Dashboard
 
 A comprehensive club management platform for FIRST Tech Challenge (FTC) teams, featuring real-time attendance tracking, task management, budget oversight, and AI-powered insights.
 
