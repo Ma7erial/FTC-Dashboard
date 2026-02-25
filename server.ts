@@ -10,6 +10,8 @@ import http from "http";
 import bcrypt from "bcryptjs";
 import multer from "multer";
 import { simpleGit, SimpleGit } from "simple-git";
+import axios from "axios";
+import * as cheerio from "cheerio";
 
 // configuration tweaks for temporary behavior
 // set this to true when you want to turn off the news endpoint
@@ -64,7 +66,7 @@ async function searchExa(query: string) {
 const DEFAULT_MAX_TOKENS = parseInt(process.env.MAX_TOKENS_LIMIT || '1024', 10);
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'phi3.5';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'gemma:2b';
 
 async function callOllama(prompt: string, stream: boolean, onChunk?: (chunk: string) => void, num_predict?: number) {
   const options: any = {};
@@ -271,6 +273,23 @@ db.exec(`
     location TEXT
   );
 
+  CREATE TABLE IF NOT EXISTS inventory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    team_id INTEGER,
+    name TEXT NOT NULL,
+    part_number TEXT,
+    sku TEXT NOT NULL UNIQUE,
+    quantity INTEGER DEFAULT 0,
+    assigned_to INTEGER,
+    location TEXT,
+    category TEXT,
+    description TEXT,
+    cost REAL DEFAULT 0,
+    date_added TEXT NOT NULL,
+    FOREIGN KEY(team_id) REFERENCES teams(id),
+    FOREIGN KEY(assigned_to) REFERENCES members(id)
+  );
+
   CREATE TABLE IF NOT EXISTS communications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     recipient TEXT NOT NULL,
@@ -286,6 +305,7 @@ db.exec(`
     file_name TEXT NOT NULL,
     file_path TEXT NOT NULL,
     language TEXT DEFAULT 'java',
+    file_size INTEGER,
     created_by INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -307,6 +327,27 @@ db.exec(`
     FOREIGN KEY(team_id) REFERENCES teams(id),
     FOREIGN KEY(file_id) REFERENCES code_files(id),
     FOREIGN KEY(author_id) REFERENCES members(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    member_id INTEGER NOT NULL,
+    ws_connection_id TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    last_activity TEXT NOT NULL,
+    FOREIGN KEY(member_id) REFERENCES members(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS stream_sessions (
+    id TEXT PRIMARY KEY,
+    member_id INTEGER NOT NULL,
+    endpoint TEXT NOT NULL,
+    chunks TEXT,
+    position INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    FOREIGN KEY(member_id) REFERENCES members(id)
   );
 `);
 
@@ -354,6 +395,18 @@ if (!messageColumns.some((c: any) => c.name === 'deleted_at')) {
 if (!messageColumns.some((c: any) => c.name === 'file_path')) {
   db.exec("ALTER TABLE messages ADD COLUMN file_path TEXT");
 }
+if (!messageColumns.some((c: any) => c.name === 'file_name')) {
+  db.exec("ALTER TABLE messages ADD COLUMN file_name TEXT");
+}
+if (!messageColumns.some((c: any) => c.name === 'file_size')) {
+  db.exec("ALTER TABLE messages ADD COLUMN file_size INTEGER");
+}
+if (!messageColumns.some((c: any) => c.name === 'file_updated')) {
+  db.exec("ALTER TABLE messages ADD COLUMN file_updated TEXT");
+}
+if (!messageColumns.some((c: any) => c.name === 'updated_at')) {
+  db.exec("ALTER TABLE messages ADD COLUMN updated_at TEXT");
+}
 
 // Verify columns exist
 const finalMemberColumns = db.prepare("PRAGMA table_info(members)").all();
@@ -374,6 +427,85 @@ function getNumericSetting(key: string, defaultValue: number): number {
   }
   return defaultValue;
 }
+
+// Session Management
+function generateSessionId(): string {
+  return 'session_' + Date.now() + '_' + Math.random().toString(36).substring(2, 11);
+}
+
+function generateStreamId(): string {
+  return 'stream_' + Date.now() + '_' + Math.random().toString(36).substring(2, 11);
+}
+
+function createSession(memberId: number): string {
+  const sessionId = generateSessionId();
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // 24 hours
+  db.prepare("INSERT INTO sessions (id, member_id, created_at, expires_at, last_activity) VALUES (?, ?, ?, ?, ?)")
+    .run(sessionId, memberId, now, expiresAt, now);
+  return sessionId;
+}
+
+function validateSession(sessionId: string): { valid: boolean; memberId?: number } {
+  try {
+    const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as any;
+    if (!session) return { valid: false };
+    
+    const now = new Date().toISOString();
+    if (now > session.expires_at) {
+      db.prepare("DELETE FROM sessions WHERE id = ?").run(sessionId);
+      return { valid: false };
+    }
+    
+    // Update last activity
+    db.prepare("UPDATE sessions SET last_activity = ? WHERE id = ?").run(now, sessionId);
+    return { valid: true, memberId: session.member_id };
+  } catch (e) {
+    return { valid: false };
+  }
+}
+
+function createStreamSession(memberId: number, endpoint: string): string {
+  const streamId = generateStreamId();
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 1 * 60 * 60 * 1000).toISOString(); // 1 hour
+  db.prepare("INSERT INTO stream_sessions (id, member_id, endpoint, chunks, position, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .run(streamId, memberId, endpoint, JSON.stringify([]), 0, now, expiresAt);
+  return streamId;
+}
+
+function addStreamChunk(streamId: string, chunk: string): void {
+  const session = db.prepare("SELECT chunks FROM stream_sessions WHERE id = ?").get(streamId) as any;
+  if (!session) return;
+  
+  const chunks = JSON.parse(session.chunks || '[]');
+  chunks.push(chunk);
+  db.prepare("UPDATE stream_sessions SET chunks = ? WHERE id = ?").run(JSON.stringify(chunks), streamId);
+}
+
+function getStreamSessionData(streamId: string): { chunks: string[]; position: number } | null {
+  try {
+    const session = db.prepare("SELECT * FROM stream_sessions WHERE id = ?").get(streamId) as any;
+    if (!session) return null;
+    
+    const now = new Date().toISOString();
+    if (now > session.expires_at) {
+      db.prepare("DELETE FROM stream_sessions WHERE id = ?").run(streamId);
+      return null;
+    }
+    
+    return { chunks: JSON.parse(session.chunks || '[]'), position: session.position };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Cleanup expired sessions periodically
+setInterval(() => {
+  const now = new Date().toISOString();
+  db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(now);
+  db.prepare("DELETE FROM stream_sessions WHERE expires_at < ?").run(now);
+}, 60 * 60 * 1000); // Every hour
 
 async function startServer() {
   const app = express();
@@ -404,6 +536,26 @@ async function startServer() {
   });
   
   app.use('/uploads', express.static(uploadDir));
+  
+  // Migration to populate missing file metadata for existing messages
+  try {
+    const messagesToFix = db.prepare("SELECT id, file_path FROM messages WHERE file_path IS NOT NULL AND file_name IS NULL").all();
+    for (const msg of messagesToFix as any) {
+      try {
+        const relativePath = msg.file_path.startsWith('/uploads/') ? msg.file_path.slice(9) : msg.file_path;
+        const fullPath = path.join(uploadDir, relativePath);
+        if (fs.existsSync(fullPath)) {
+          const stats = fs.statSync(fullPath);
+          db.prepare("UPDATE messages SET file_name = ?, file_size = ?, file_updated = ? WHERE id = ?")
+            .run(path.basename(fullPath), stats.size, stats.mtime.toISOString(), msg.id);
+        }
+      } catch (err) {
+        console.error(`Failed to migrate metadata for message ${msg.id}:`, err);
+      }
+    }
+  } catch (err) {
+    console.error("Migration query failed:", err);
+  }
   
   const PORT = 3000;
 
@@ -481,11 +633,13 @@ async function startServer() {
     if (!user) return res.status(401).json({ error: "User not found" });
 
     if (!user.password) {
-      return res.json({ needsSetup: true, user });
+      const sessionId = createSession(user.id);
+      return res.json({ needsSetup: true, user, sessionId });
     }
 
     if (bcrypt.compareSync(password, user.password)) {
-      res.json({ user });
+      const sessionId = createSession(user.id);
+      res.json({ user, sessionId });
     } else {
       res.status(401).json({ error: "Invalid password" });
     }
@@ -496,7 +650,8 @@ async function startServer() {
     const hashedPassword = bcrypt.hashSync(password, 10);
     db.prepare("UPDATE members SET password = ?, is_setup = 1 WHERE email = ?").run(hashedPassword, email);
     const user = db.prepare("SELECT * FROM members WHERE email = ?").get(email);
-    res.json({ user });
+    const sessionId = createSession(user.id);
+    res.json({ user, sessionId });
   });
 
   app.post("/api/auth/reset", (req, res) => {
@@ -546,8 +701,9 @@ async function startServer() {
   app.post("/api/members", (req, res) => {
     const { team_id, name, role, email, is_board, scopes, accent_color, primary_color, text_color } = req.body;
     const finalScopes = typeof scopes === 'string' ? scopes : JSON.stringify(scopes || []);
+    const targetTeamId = team_id || null;
     const info = db.prepare("INSERT INTO members (team_id, name, role, email, is_board, scopes, accent_color, primary_color, text_color) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(team_id, name, role, email, is_board ? 1 : 0, finalScopes, accent_color || null, primary_color || null, text_color || null);
+      .run(targetTeamId, name, role, email, is_board ? 1 : 0, finalScopes, accent_color || null, primary_color || null, text_color || null);
     res.json({ id: info.lastInsertRowid });
   });
 
@@ -559,7 +715,8 @@ async function startServer() {
 
     // Only update color fields if they're explicitly provided (not undefined)
     const updates: any = {
-      team_id, name, role, email,
+      team_id: team_id || null,
+      name, role, email,
       is_board: is_board ? 1 : 0,
       scopes: finalScopes
     };
@@ -721,10 +878,13 @@ async function startServer() {
     const { sender_id, sender_name, content } = req.body;
     const timestamp = new Date().toISOString();
     const filePath = `/uploads/${req.file.filename}`;
+    const fileName = req.file.originalname;
+    const fileSize = req.file.size;
+    const fileUpdated = new Date().toISOString();
     
     const info = db.prepare(
-      "INSERT INTO messages (sender_id, content, timestamp, file_path) VALUES (?, ?, ?, ?)"
-    ).run(sender_id, content || '', timestamp, filePath);
+      "INSERT INTO messages (sender_id, content, timestamp, file_path, file_name, file_size, file_updated) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).run(sender_id, content || '', timestamp, filePath, fileName, fileSize, fileUpdated);
     
     broadcast({
       type: "chat",
@@ -733,12 +893,18 @@ async function startServer() {
       sender_name,
       content: content || '',
       file_path: filePath,
+      file_name: fileName,
+      file_size: fileSize,
+      file_updated: fileUpdated,
       timestamp
     });
     
     res.json({ 
       id: info.lastInsertRowid, 
       file_path: filePath,
+      file_name: fileName,
+      file_size: fileSize,
+      file_updated: fileUpdated,
       sender_id: parseInt(sender_id),
       sender_name,
       content: content || '',
@@ -746,20 +912,44 @@ async function startServer() {
     });
   });
 
-  // Delete message
+  // Delete message (hard delete - permanent removal)
   app.delete("/api/messages/:id", (req, res) => {
     const messageId = req.params.id;
-    const deletedAt = new Date().toISOString();
+    const silent = req.query.silent === 'true'; // Check for silent deletion
     
-    db.prepare("UPDATE messages SET deleted_at = ? WHERE id = ?")
-      .run(deletedAt, messageId);
+    try {
+      // Hard delete - permanently remove the message from database
+      db.prepare("DELETE FROM messages WHERE id = ?")
+        .run(messageId);
+      
+      if (!silent) { // Only broadcast if not silent deletion
+        broadcast({
+          type: "message_deleted",
+          id: parseInt(messageId),
+          deleted_permanently: true
+        });
+      }
+      
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Error deleting message:', error);
+      res.status(500).json({ error: 'Failed to delete message' });
+    }
+  });
+
+  // PATCH: Update message content (silent edit)
+  app.patch("/api/messages/:id", (req, res) => {
+    const messageId = req.params.id;
+    const { content } = req.body;
+
+    if (!content) {
+      return res.status(400).json({ error: "Content is required for message update" });
+    }
+
+    db.prepare("UPDATE messages SET content = ?, updated_at = ? WHERE id = ?")
+      .run(content, new Date().toISOString(), messageId);
     
-    broadcast({
-      type: "message_deleted",
-      id: parseInt(messageId),
-      deleted_at: deletedAt
-    });
-    
+    // No broadcast for silent edit
     res.json({ success: true });
   });
 
@@ -791,6 +981,20 @@ async function startServer() {
     }
   });
 
+  app.get("/api/admin/storage-usage", (req, res) => {
+    try {
+      const messageFilesSize = db.prepare("SELECT SUM(file_size) as total FROM messages WHERE file_size IS NOT NULL").get() as any;
+      const codeFilesSize = db.prepare("SELECT SUM(file_size) as total FROM code_files WHERE file_size IS NOT NULL").get() as any;
+      
+      const totalSize = (messageFilesSize?.total || 0) + (codeFilesSize?.total || 0);
+      
+      res.json({ totalSize });
+    } catch (error) {
+      console.error("Error fetching storage usage:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
   app.post("/api/settings", (req, res) => {
     try {
       const { key, value } = req.body;
@@ -817,11 +1021,15 @@ async function startServer() {
     try {
       const { team_id, title, description, status, assigned_to, due_date, is_board } = req.body;
       const createdAt = new Date().toISOString();
-      const info = db.prepare("INSERT INTO tasks (team_id, title, description, status, assigned_to, due_date, is_board, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-        .run(team_id, title, description, status || 'todo', assigned_to, due_date, is_board || 0, createdAt);
+      
+      const targetTeamId = team_id || null;
+      const targetAssignedTo = assigned_to || null;
 
-      if (assigned_to) {
-        createNotification(assigned_to, `New task assigned: ${title}`, 'task');
+      const info = db.prepare("INSERT INTO tasks (team_id, title, description, status, assigned_to, due_date, is_board, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(targetTeamId, title, description, status || 'todo', targetAssignedTo, due_date, is_board || 0, createdAt);
+
+      if (targetAssignedTo) {
+        createNotification(targetAssignedTo, `New task assigned: ${title}`, 'task');
       }
 
       res.json({ id: info.lastInsertRowid });
@@ -878,8 +1086,9 @@ async function startServer() {
   app.post("/api/budget", (req, res) => {
     try {
       const { team_id, type, amount, category, description, date } = req.body;
+      const targetTeamId = team_id || null;
       const info = db.prepare("INSERT INTO budget (team_id, type, amount, category, description, date) VALUES (?, ?, ?, ?, ?, ?)")
-        .run(team_id, type, amount, category, description, date);
+        .run(targetTeamId, type, amount, category, description, date);
 
       // Notify board members of budget changes
       const boardMembers = db.prepare("SELECT id FROM members WHERE is_board = 1").all();
@@ -941,6 +1150,142 @@ async function startServer() {
     } catch (error) {
       console.error("Error deleting outreach event:", error);
       res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  // Inventory
+  app.get("/api/inventory", (req, res) => {
+    try {
+      const inventory = db.prepare(`
+        SELECT i.*, m.name as assigned_member_name 
+        FROM inventory i 
+        LEFT JOIN members m ON i.assigned_to = m.id
+        ORDER BY i.date_added DESC
+      `).all();
+      res.json(inventory);
+    } catch (error) {
+      console.error("Error fetching inventory:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  app.post("/api/inventory", (req, res) => {
+    try {
+      const { team_id, name, part_number, sku, quantity, assigned_to, location, category, description, cost } = req.body;
+      if (!sku || !name) {
+        return res.status(400).json({ error: "SKU and name are required" });
+      }
+      const date_added = new Date().toISOString();
+      const info = db.prepare(`
+        INSERT INTO inventory (team_id, name, part_number, sku, quantity, assigned_to, location, category, description, cost, date_added) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(team_id || null, name, part_number || null, sku, quantity || 0, assigned_to || null, location || '', category || '', description || '', cost || 0, date_added);
+
+      res.json({ id: info.lastInsertRowid });
+    } catch (error: any) {
+      console.error("Error creating inventory item:", error);
+      if (error.message.includes("UNIQUE constraint failed")) {
+        res.status(400).json({ error: "SKU already exists" });
+      } else {
+        res.status(500).json({ error: "Internal server error" });
+      }
+    }
+  });
+
+  app.patch("/api/inventory/:id", (req, res) => {
+    try {
+      const { team_id, name, part_number, sku, quantity, assigned_to, location, category, description, cost } = req.body;
+      const id = req.params.id;
+      
+      db.prepare(`
+        UPDATE inventory 
+        SET team_id = ?, name = ?, part_number = ?, sku = ?, quantity = ?, assigned_to = ?, location = ?, category = ?, description = ?, cost = ?
+        WHERE id = ?
+      `).run(team_id || null, name, part_number, sku, quantity, assigned_to || null, location, category, description, cost, id);
+
+      res.json({ success: true });
+    } catch (error: any) {
+      console.error("Error updating inventory item:", error);
+      if (error.message.includes("UNIQUE constraint failed")) {
+        res.status(400).json({ error: "SKU already exists" });
+      } else {
+        res.status(500).json({ error: "Internal server error" });
+      }
+    }
+  });
+
+  app.delete("/api/inventory/:id", (req, res) => {
+    try {
+      db.prepare("DELETE FROM inventory WHERE id = ?").run(req.params.id);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error deleting inventory item:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  // Scrape REV Robotics product page
+  app.post("/api/inventory/scrape-rev", async (req, res) => {
+    try {
+      const { url } = req.body;
+      if (!url || !url.includes("revrobotics.com")) {
+        return res.status(400).json({ error: "Invalid REV Robotics URL" });
+      }
+
+      const response = await axios.get(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+      });
+
+      const $ = cheerio.load(response.data);
+      
+      const data: any = {};
+
+      // Extract title
+      const titleElement = $("h1.productView-title");
+      if (titleElement.length > 0) {
+        data.name = titleElement.text().trim();
+      }
+
+      // Extract SKU
+      const skuElement = $("dd.productView-info-value--sku");
+      if (skuElement.length > 0) {
+        const sku = skuElement.text().trim();
+        if (sku) data.sku = sku;
+      }
+
+      // Extract Product Code/UPC
+      const upcElement = $("dd.productView-info-value--upc");
+      if (upcElement.length > 0) {
+        const upc = upcElement.text().trim();
+        if (upc) data.part_number = upc;
+      }
+
+      // Extract price
+      const priceElement = $("span.price.price--withoutTax.price--main");
+      if (priceElement.length > 0) {
+        const priceText = priceElement.text().trim();
+        const priceMatch = priceText.match(/[\d.]+/);
+        if (priceMatch) {
+          data.cost = parseFloat(priceMatch[0]);
+        }
+      }
+
+      // Extract category if available
+      const categoryElement = $("a[href*='/cat/']");
+      if (categoryElement.length > 0) {
+        data.category = categoryElement.first().text().trim();
+      }
+
+      if (!data.name && !data.sku) {
+        return res.status(400).json({ error: "Could not extract product information from the page. Make sure the URL is correct." });
+      }
+
+      res.json(data);
+    } catch (error: any) {
+      console.error("Error scraping REV page:", error.message);
+      res.status(500).json({ error: "Failed to scrape page: " + error.message });
     }
   });
 
@@ -1032,20 +1377,60 @@ async function startServer() {
 
   app.post("/api/ai/attendance", async (req, res) => {
     try {
-      const { records, members } = req.body;
+      const { records, members, sessionId } = req.body;
+      const streamId = req.query.streamId as string | undefined;
+      const resumeFrom = parseInt(req.query.resumeFrom as string || '0', 10);
+
+      // Validate session if provided
+      let memberId: number | undefined;
+      if (sessionId) {
+        const validation = validateSession(sessionId);
+        if (validation.valid) {
+          memberId = validation.memberId;
+        }
+      }
+
+      // Handle resume request
+      if (streamId && req.query.stream === 'true') {
+        const streamData = getStreamSessionData(streamId);
+        if (streamData) {
+          res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+          res.setHeader('Transfer-Encoding', 'chunked');
+          res.setHeader('Cache-Control', 'no-cache');
+          res.setHeader('Connection', 'keep-alive');
+          res.flushHeaders();
+
+          // Send remaining chunks from resumeFrom position
+          const remainingChunks = streamData.chunks.slice(resumeFrom);
+          for (const chunk of remainingChunks) {
+            res.write(chunk);
+          }
+          res.end();
+          return;
+        }
+      }
+
       const data = JSON.stringify({ records, members });
       const prompt =
         `Analyze this attendance data for a robotics club and provide 3 key insights or suggestions for the leadership team. Keep it concise and suitable for the general population.\n\nData: ${data}`;
 
       if (req.query.stream === 'true') {
+        // Create new stream session
+        const newStreamId = memberId ? createStreamSession(memberId, '/api/ai/attendance') : generateStreamId();
+
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         res.setHeader('Transfer-Encoding', 'chunked');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Stream-ID', newStreamId);
         res.flushHeaders();
+
         const numPredict = getNumericSetting('max_tokens_attendance', DEFAULT_MAX_TOKENS);
         await callOllama(prompt, true, (chunk) => {
           res.write(chunk);
+          if (memberId) {
+            addStreamChunk(newStreamId, chunk);
+          }
         }, numPredict);
         res.end();
       } else {
@@ -1090,29 +1475,67 @@ async function startServer() {
 
   app.post("/api/ai/activity-summary", async (req, res) => {
     try {
-      const { tasks, messages, budget, userScope } = req.body;
-      const payload = JSON.stringify({ tasks, messages, budget });
+      const { tasks, messages, budget, inventory, userScope, sessionId } = req.body;
+      const streamId = req.query.streamId as string | undefined;
+      const resumeFrom = parseInt(req.query.resumeFrom as string || '0', 10);
+
+      // Validate session if provided
+      let memberId: number | undefined;
+      if (sessionId) {
+        const validation = validateSession(sessionId);
+        if (validation.valid) {
+          memberId = validation.memberId;
+        }
+      }
+
+      // Handle resume request
+      if (streamId && req.query.stream === 'true') {
+        const streamData = getStreamSessionData(streamId);
+        if (streamData) {
+          res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+          res.setHeader('Transfer-Encoding', 'chunked');
+          res.setHeader('Cache-Control', 'no-cache');
+          res.setHeader('Connection', 'keep-alive');
+          res.flushHeaders();
+
+          // Send remaining chunks from resumeFrom position
+          const remainingChunks = streamData.chunks.slice(resumeFrom);
+          for (const chunk of remainingChunks) {
+            res.write(chunk);
+          }
+          res.end();
+          return;
+        }
+      }
+
+      const payload = JSON.stringify({ tasks, messages, budget, inventory });
       const prompt =
         `Provide a concise summary of the recent club activity based on the following data. ` +
         `I have the following role/scope: ${JSON.stringify(userScope)}. ` +
         `Only include information that would be relevant or accessible to me. ` +
-        `Highlight progress, concerns, and upcoming deadlines, if any. Keep it short and scannable, bullet point format. Even though there are IDs and programmatic details, do not include those in summary. ` +
-        `EXAMPLE: 1) Johanna messaged you in chat to see if you were up for a meeting.` +
-        `\n2) It looks like you have not completed the task "Design CAD model. It's due tomorrow."` +
-        `\n3) Bob finished the task "Build chassis."` +
-        `\n4) There are no outreach logs yet. Go see if you can fix that."` +
-
-        `\n\nData: ${payload}`;
+        `Highlight progress on tasks, new messages, budget changes, and inventory updates. ` +
+        `Identify concerns and upcoming deadlines. Keep it short and scannable in bullet point format. ` +
+        `Do NOT include IDs or programmatic details. Do NOT reference any people or data that is not in the provided data. ` +
+        `Only summarize what is actually present in the following data and nothing else. ` +
+        `\n\nData to summarize: ${payload}`;
 
       if (req.query.stream === 'true') {
+        // Create new stream session
+        const newStreamId = memberId ? createStreamSession(memberId, '/api/ai/activity-summary') : generateStreamId();
+
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         res.setHeader('Transfer-Encoding', 'chunked');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Stream-ID', newStreamId);
         res.flushHeaders();
+
         const numPredict = getNumericSetting('max_tokens_summary', DEFAULT_MAX_TOKENS);
         await callOllama(prompt, true, (chunk) => {
           res.write(chunk);
+          if (memberId) {
+            addStreamChunk(newStreamId, chunk);
+          }
         }, numPredict);
         res.end();
       } else {
@@ -1225,10 +1648,12 @@ async function startServer() {
       }
 
       const now = new Date().toISOString();
+      const fileSize = Buffer.byteLength(content || '', 'utf-8');
+
       const fileInfo = db.prepare(`
-        INSERT OR REPLACE INTO code_files (team_id, file_name, file_path, language, created_by, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(team_id, file_name, file_path, language, author_id, now, now);
+        INSERT OR REPLACE INTO code_files (team_id, file_name, file_path, language, file_size, created_by, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(team_id, file_name, file_path, language, fileSize, author_id, now, now);
 
       const fileId = fileInfo.lastInsertRowid as number;
 
