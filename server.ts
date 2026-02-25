@@ -412,6 +412,11 @@ if (!messageColumns.some((c: any) => c.name === 'updated_at')) {
 const finalMemberColumns = db.prepare("PRAGMA table_info(members)").all();
 console.log("[DB Migration] Members table columns:", finalMemberColumns.map((c: any) => c.name).join(", "));
 
+const codeFilesColumns = db.prepare("PRAGMA table_info(code_files)").all();
+if (!codeFilesColumns.some((c: any) => c.name === 'file_size')) {
+  db.exec("ALTER TABLE code_files ADD COLUMN file_size INTEGER");
+}
+
 db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_member_date ON attendance(member_id, date)");
 
 // Initial data
