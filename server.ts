@@ -8,6 +8,8 @@ import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
 import bcrypt from "bcryptjs";
+import multer from "multer";
+import { simpleGit, SimpleGit } from "simple-git";
 
 // configuration tweaks for temporary behavior
 // set this to true when you want to turn off the news endpoint
@@ -21,7 +23,7 @@ async function searchExa(query: string) {
     console.warn("EXA_API_KEY not found, falling back to basic prompt.");
     return null;
   }
-  
+
   try {
     const response = await fetch('https://api.exa.ai/search', {
       method: 'POST',
@@ -41,13 +43,13 @@ async function searchExa(query: string) {
         }
       })
     });
-
     if (!response.ok) {
       console.error("Exa API error:", response.status, response.statusText);
       return null;
     }
 
     const data: any = await response.json();
+    console.log("Exa API response:", JSON.stringify(data, null, 2));
     return data.results.map((r: any) => ({
       title: r.title,
       url: r.url,
@@ -64,7 +66,14 @@ const DEFAULT_MAX_TOKENS = parseInt(process.env.MAX_TOKENS_LIMIT || '1024', 10);
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'phi3.5';
 
-async function callOllama(prompt: string, stream: boolean, onChunk?: (chunk: string) => void) {
+async function callOllama(prompt: string, stream: boolean, onChunk?: (chunk: string) => void, num_predict?: number) {
+  const options: any = {};
+  if (num_predict && num_predict > 0) {
+    options.num_predict = num_predict;
+  } else {
+    options.num_predict = DEFAULT_MAX_TOKENS;
+  }
+
   const response = await fetch(OLLAMA_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -72,9 +81,8 @@ async function callOllama(prompt: string, stream: boolean, onChunk?: (chunk: str
       model: OLLAMA_MODEL,
       prompt: prompt,
       stream: stream,
-      options: {
-        num_predict: DEFAULT_MAX_TOKENS
-      }
+      options,
+      keep_alive: -1
     })
   });
 
@@ -91,7 +99,7 @@ async function callOllama(prompt: string, stream: boolean, onChunk?: (chunk: str
     try {
       while (true) {
         const { done, value } = await reader.read();
-        
+
         if (value) {
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split('\n');
@@ -249,7 +257,37 @@ db.exec(`
     date TEXT NOT NULL,
     type TEXT DEFAULT 'email' -- 'email', 'announcement'
   );
+
+  CREATE TABLE IF NOT EXISTS code_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    team_id INTEGER,
+    file_name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    language TEXT DEFAULT 'java',
+    created_by INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(team_id) REFERENCES teams(id),
+    FOREIGN KEY(created_by) REFERENCES members(id),
+    UNIQUE(team_id, file_path)
+  );
+
+  CREATE TABLE IF NOT EXISTS code_commits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    team_id INTEGER,
+    file_id INTEGER,
+    branch TEXT DEFAULT 'main',
+    author_id INTEGER,
+    message TEXT NOT NULL,
+    content TEXT NOT NULL,
+    hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(team_id) REFERENCES teams(id),
+    FOREIGN KEY(file_id) REFERENCES code_files(id),
+    FOREIGN KEY(author_id) REFERENCES members(id)
+  );
 `);
+
 
 // Migrations - Handle structural updates for existing databases
 const memberColumns = db.prepare("PRAGMA table_info(members)").all();
@@ -265,6 +303,40 @@ if (!taskColumns.some((c: any) => c.name === 'is_board')) {
   db.exec("ALTER TABLE tasks ADD COLUMN is_board INTEGER DEFAULT 0");
 }
 
+const teamColumns = db.prepare("PRAGMA table_info(teams)").all();
+if (!teamColumns.some((c: any) => c.name === 'accent_color')) {
+  db.exec("ALTER TABLE teams ADD COLUMN accent_color TEXT");
+}
+if (!teamColumns.some((c: any) => c.name === 'primary_color')) {
+  db.exec("ALTER TABLE teams ADD COLUMN primary_color TEXT");
+}
+if (!teamColumns.some((c: any) => c.name === 'text_color')) {
+  db.exec("ALTER TABLE teams ADD COLUMN text_color TEXT");
+}
+
+if (!memberColumns.some((c: any) => c.name === 'accent_color')) {
+  db.exec("ALTER TABLE members ADD COLUMN accent_color TEXT");
+}
+if (!memberColumns.some((c: any) => c.name === 'primary_color')) {
+  db.exec("ALTER TABLE members ADD COLUMN primary_color TEXT");
+}
+if (!memberColumns.some((c: any) => c.name === 'text_color')) {
+  db.exec("ALTER TABLE members ADD COLUMN text_color TEXT");
+}
+
+// Messages table migrations
+const messageColumns = db.prepare("PRAGMA table_info(messages)").all();
+if (!messageColumns.some((c: any) => c.name === 'deleted_at')) {
+  db.exec("ALTER TABLE messages ADD COLUMN deleted_at TEXT");
+}
+if (!messageColumns.some((c: any) => c.name === 'file_path')) {
+  db.exec("ALTER TABLE messages ADD COLUMN file_path TEXT");
+}
+
+// Verify columns exist
+const finalMemberColumns = db.prepare("PRAGMA table_info(members)").all();
+console.log("[DB Migration] Members table columns:", finalMemberColumns.map((c: any) => c.name).join(", "));
+
 db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_member_date ON attendance(member_id, date)");
 
 // Initial data
@@ -272,17 +344,50 @@ db.exec(`
   INSERT OR IGNORE INTO settings (key, value) VALUES ('excuse_criteria', 'Excused if for school, family emergency, or illness. Unexcused for gaming, hanging out, or forgetting.');
 `);
 
+function getNumericSetting(key: string, defaultValue: number): number {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as any;
+  if (row && row.value) {
+    const val = parseInt(row.value, 10);
+    return isNaN(val) ? defaultValue : val;
+  }
+  return defaultValue;
+}
+
 async function startServer() {
   const app = express();
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server });
 
   app.use(express.json());
+  
+  // Configure multer for file uploads
+  const uploadDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'uploads');
+  if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+  }
+  
+  const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+      cb(null, uploadDir);
+    },
+    filename: (req, file, cb) => {
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+      cb(null, uniqueSuffix + path.extname(file.originalname));
+    }
+  });
+  
+  const upload = multer({ 
+    storage,
+    limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+  });
+  
+  app.use('/uploads', express.static(uploadDir));
+  
   const PORT = 3000;
 
   // --- WebSocket Logic ---
   const clients = new Set<WebSocket>();
-  
+
   const broadcast = (data: any) => {
     const payload = JSON.stringify(data);
     clients.forEach(client => {
@@ -294,7 +399,7 @@ async function startServer() {
     const timestamp = new Date().toISOString();
     const info = db.prepare("INSERT INTO notifications (user_id, content, type, timestamp) VALUES (?, ?, ?, ?)")
       .run(userId, content, type, timestamp);
-    
+
     broadcast({
       type: 'notification',
       notification: {
@@ -318,7 +423,7 @@ async function startServer() {
           const stmt = db.prepare("INSERT INTO messages (sender_id, content, timestamp) VALUES (?, ?, ?)");
           const timestamp = new Date().toISOString();
           const info = stmt.run(message.sender_id, message.content, timestamp);
-          
+
           // Handle mentions
           const mentions = message.content.match(/@\[([^\]]+)\]/g);
           if (mentions) {
@@ -350,9 +455,9 @@ async function startServer() {
   app.post("/api/auth/login", (req, res) => {
     const { email, password } = req.body;
     const user = db.prepare("SELECT * FROM members WHERE email = ?").get(email) as any;
-    
+
     if (!user) return res.status(401).json({ error: "User not found" });
-    
+
     if (!user.password) {
       return res.json({ needsSetup: true, user });
     }
@@ -387,14 +492,16 @@ async function startServer() {
   });
 
   app.post("/api/teams", (req, res) => {
-    const { name, number } = req.body;
-    const info = db.prepare("INSERT INTO teams (name, number) VALUES (?, ?)").run(name, number);
+    const { name, number, accent_color, primary_color, text_color } = req.body;
+    const info = db.prepare("INSERT INTO teams (name, number, accent_color, primary_color, text_color) VALUES (?, ?, ?, ?, ?)")
+      .run(name, number, accent_color || null, primary_color || null, text_color || null);
     res.json({ id: info.lastInsertRowid });
   });
 
   app.patch("/api/teams/:id", (req, res) => {
-    const { name, number } = req.body;
-    db.prepare("UPDATE teams SET name = ?, number = ? WHERE id = ?").run(name, number, req.params.id);
+    const { name, number, accent_color, primary_color, text_color } = req.body;
+    db.prepare("UPDATE teams SET name = ?, number = ?, accent_color = ?, primary_color = ?, text_color = ? WHERE id = ?")
+      .run(name, number, accent_color || null, primary_color || null, text_color || null, req.params.id);
     res.json({ success: true });
   });
 
@@ -410,27 +517,51 @@ async function startServer() {
       FROM members m 
       LEFT JOIN teams t ON m.team_id = t.id
     `).all();
+    console.log("[GET /api/members] Sample member data:", JSON.stringify(members[0] || {}, null, 2));
     res.json(members);
   });
 
   app.post("/api/members", (req, res) => {
-    const { team_id, name, role, email, is_board, scopes } = req.body;
+    const { team_id, name, role, email, is_board, scopes, accent_color, primary_color, text_color } = req.body;
     const finalScopes = typeof scopes === 'string' ? scopes : JSON.stringify(scopes || []);
-    const info = db.prepare("INSERT INTO members (team_id, name, role, email, is_board, scopes) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(team_id, name, role, email, is_board ? 1 : 0, finalScopes);
+    const info = db.prepare("INSERT INTO members (team_id, name, role, email, is_board, scopes, accent_color, primary_color, text_color) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(team_id, name, role, email, is_board ? 1 : 0, finalScopes, accent_color || null, primary_color || null, text_color || null);
     res.json({ id: info.lastInsertRowid });
   });
 
   app.patch("/api/members/:id", (req, res) => {
-    const { team_id, name, role, email, is_board, scopes } = req.body;
+    const { team_id, name, role, email, is_board, scopes, accent_color, primary_color, text_color } = req.body;
+    console.log(`[PATCH /api/members] ID: ${req.params.id}`);
+    console.log(`[PATCH /api/members] Received colors:`, { accent_color, primary_color, text_color });
     const finalScopes = typeof scopes === 'string' ? scopes : JSON.stringify(scopes || []);
-    db.prepare("UPDATE members SET team_id = ?, name = ?, role = ?, email = ?, is_board = ?, scopes = ? WHERE id = ?")
-      .run(team_id, name, role, email, is_board ? 1 : 0, finalScopes, req.params.id);
+
+    // Only update color fields if they're explicitly provided (not undefined)
+    const updates: any = {
+      team_id, name, role, email,
+      is_board: is_board ? 1 : 0,
+      scopes: finalScopes
+    };
+
+    if (accent_color !== undefined) updates.accent_color = accent_color;
+    if (primary_color !== undefined) updates.primary_color = primary_color;
+    if (text_color !== undefined) updates.text_color = text_color;
+
+    const columns = Object.keys(updates);
+    const placeholders = columns.map(() => '?').join(', ');
+    const setClause = columns.map(col => `${col} = ?`).join(', ');
+
+    db.prepare(`UPDATE members SET ${setClause} WHERE id = ?`)
+      .run(...Object.values(updates), parseInt(req.params.id, 10));
+
+    // Verify what was saved
+    const updated = db.prepare("SELECT accent_color, primary_color, text_color FROM members WHERE id = ?").get(parseInt(req.params.id, 10)) as any;
+    console.log(`[PATCH /api/members] Verified saved colors:`, updated);
+
     res.json({ success: true });
   });
 
   app.delete("/api/members/:id", (req, res) => {
-    db.prepare("DELETE FROM members WHERE id = ?").run(req.params.id);
+    db.prepare("DELETE FROM members WHERE id = ?").run(parseInt(req.params.id, 10));
     res.json({ success: true });
   });
 
@@ -469,7 +600,7 @@ async function startServer() {
           reason = COALESCE(excluded.reason, attendance.reason)
       `);
       const deleteStmt = db.prepare("DELETE FROM attendance WHERE member_id = ? AND date = ?");
-      
+
       const transaction = db.transaction((data) => {
         for (const rec of data) {
           if (rec.status === null || rec.status === '-') {
@@ -556,6 +687,57 @@ async function startServer() {
     res.json(msgs);
   });
 
+  // File upload for messages
+  app.post("/api/messages/upload", upload.single('file'), (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+    
+    const { sender_id, sender_name, content } = req.body;
+    const timestamp = new Date().toISOString();
+    const filePath = `/uploads/${req.file.filename}`;
+    
+    const info = db.prepare(
+      "INSERT INTO messages (sender_id, content, timestamp, file_path) VALUES (?, ?, ?, ?)"
+    ).run(sender_id, content || '', timestamp, filePath);
+    
+    broadcast({
+      type: "chat",
+      id: info.lastInsertRowid,
+      sender_id: parseInt(sender_id),
+      sender_name,
+      content: content || '',
+      file_path: filePath,
+      timestamp
+    });
+    
+    res.json({ 
+      id: info.lastInsertRowid, 
+      file_path: filePath,
+      sender_id: parseInt(sender_id),
+      sender_name,
+      content: content || '',
+      timestamp
+    });
+  });
+
+  // Delete message
+  app.delete("/api/messages/:id", (req, res) => {
+    const messageId = req.params.id;
+    const deletedAt = new Date().toISOString();
+    
+    db.prepare("UPDATE messages SET deleted_at = ? WHERE id = ?")
+      .run(deletedAt, messageId);
+    
+    broadcast({
+      type: "message_deleted",
+      id: parseInt(messageId),
+      deleted_at: deletedAt
+    });
+    
+    res.json({ success: true });
+  });
+
   // Notifications
   app.get("/api/notifications/:userId", (req, res) => {
     const notes = db.prepare("SELECT * FROM notifications WHERE user_id = ? ORDER BY timestamp DESC LIMIT 50")
@@ -612,11 +794,11 @@ async function startServer() {
       const createdAt = new Date().toISOString();
       const info = db.prepare("INSERT INTO tasks (team_id, title, description, status, assigned_to, due_date, is_board, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
         .run(team_id, title, description, status || 'todo', assigned_to, due_date, is_board || 0, createdAt);
-      
+
       if (assigned_to) {
         createNotification(assigned_to, `New task assigned: ${title}`, 'task');
       }
-      
+
       res.json({ id: info.lastInsertRowid });
     } catch (error) {
       console.error("Error creating task:", error);
@@ -628,18 +810,18 @@ async function startServer() {
     try {
       const { status } = req.body;
       const completedAt = status === 'done' ? new Date().toISOString() : null;
-      
+
       if (status === 'done') {
         db.prepare("UPDATE tasks SET status = ?, completed_at = ? WHERE id = ?").run(status, completedAt, req.params.id);
       } else {
         db.prepare("UPDATE tasks SET status = ?, completed_at = NULL WHERE id = ?").run(status, req.params.id);
       }
-      
+
       const task = db.prepare("SELECT * FROM tasks WHERE id = ?").get(req.params.id) as any;
       if (task && task.assigned_to) {
         createNotification(task.assigned_to, `Task status updated to ${status}: ${task.title}`, 'task');
       }
-      
+
       res.json({ success: true });
     } catch (error) {
       console.error("Error updating task:", error);
@@ -673,7 +855,7 @@ async function startServer() {
       const { team_id, type, amount, category, description, date } = req.body;
       const info = db.prepare("INSERT INTO budget (team_id, type, amount, category, description, date) VALUES (?, ?, ?, ?, ?, ?)")
         .run(team_id, type, amount, category, description, date);
-      
+
       // Notify board members of budget changes
       const boardMembers = db.prepare("SELECT id FROM members WHERE is_board = 1").all();
       boardMembers.forEach((m: any) => {
@@ -713,7 +895,7 @@ async function startServer() {
       const { title, description, date, hours, location } = req.body;
       const info = db.prepare("INSERT INTO outreach (title, description, date, hours, location) VALUES (?, ?, ?, ?, ?)")
         .run(title, description, date, hours, location);
-      
+
       // Notify everyone of new outreach
       const allMembers = db.prepare("SELECT id FROM members").all();
       allMembers.forEach((m: any) => {
@@ -789,15 +971,15 @@ async function startServer() {
       }
 
       const { stream } = req.query;
-      
+
       // 1. Search Exa for fresh info
-      const searchResults = await searchExa("latest FIRST Tech Challenge (FTC) robotics news and updates");
-      
-      let prompt = "Search for the latest FIRST Tech Challenge (FTC) news, REV Robotics updates, and interesting engineering tips for robotics teams. Summarize the top 5 most relevant items for a high school robotics club. Include links if possible.";
-      
+      const searchResults = await searchExa("latest FIRST Tech Challenge (FTC) robotics news and updates not including gameplay, unique ideas from team websites, portfolios, hardware news, etc");
+
+      let prompt = "Search for the latest FIRST Tech Challenge (FTC) news, REV Robotics updates, and interesting engineering tips for robotics teams. Summarize the top 5 most relevant items for a high school robotics club. Include *full* links including protocol (http/https).";
+
       if (searchResults && searchResults.length > 0) {
         const context = searchResults.map(r => `Title: ${r.title}\nURL: ${r.url}\nSummary: ${r.highlight}`).join("\n\n");
-        prompt = `Based on these recent search results from Exa, summarize the top 5 most relevant FTC/Robotics news items for a high school club. Include links to the sources.\n\nSearch Results:\n${context}`;
+        prompt = `Based on these recent search results, summarize the top 5 most relevant FTC/Robotics news items for a high school club. Include the links to the sources provided.\n\nSearch Results:\n${context}`;
       }
 
       if (stream === 'true') {
@@ -807,12 +989,14 @@ async function startServer() {
         res.setHeader('Connection', 'keep-alive');
         res.flushHeaders();
 
+        const numPredict = getNumericSetting('max_tokens_news', DEFAULT_MAX_TOKENS);
         await callOllama(prompt, true, (chunk) => {
           res.write(chunk);
-        });
+        }, numPredict);
         res.end();
       } else {
-        const response = await callOllama(prompt, false);
+        const numPredict = getNumericSetting('max_tokens_news', DEFAULT_MAX_TOKENS);
+        const response = await callOllama(prompt, false, undefined, numPredict);
         res.json({ result: response });
       }
     } catch (error) {
@@ -826,7 +1010,7 @@ async function startServer() {
       const { records, members } = req.body;
       const data = JSON.stringify({ records, members });
       const prompt =
-        `Analyze this attendance data for a robotics club and provide 3 key insights or suggestions for the leadership team. Keep it concise.\n\nData: ${data}`;
+        `Analyze this attendance data for a robotics club and provide 3 key insights or suggestions for the leadership team. Keep it concise and suitable for the general population.\n\nData: ${data}`;
 
       if (req.query.stream === 'true') {
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
@@ -834,12 +1018,14 @@ async function startServer() {
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
         res.flushHeaders();
+        const numPredict = getNumericSetting('max_tokens_attendance', DEFAULT_MAX_TOKENS);
         await callOllama(prompt, true, (chunk) => {
           res.write(chunk);
-        });
+        }, numPredict);
         res.end();
       } else {
-        const response = await callOllama(prompt, false);
+        const numPredict = getNumericSetting('max_tokens_attendance', DEFAULT_MAX_TOKENS);
+        const response = await callOllama(prompt, false, undefined, numPredict);
         res.json({ result: response });
       }
     } catch (error) {
@@ -852,8 +1038,8 @@ async function startServer() {
     try {
       const { reason, criteria } = req.body;
       const prompt =
-        `Based on these criteria: "${criteria}", is the following reason for absence excused? ` +
-        `Respond with "EXCUSED" or "UNEXCUSED" followed by a very brief explanation.\n\nReason: "${reason}"`;
+        `Based on these criteria: "${criteria}", is my following reason for absence excused? ` +
+        `Respond with "EXCUSED" or "UNEXCUSED" and give me a very brief explanation. (One sentence)\n\nReason: "${reason}"`;
 
       if (req.query.stream === 'true') {
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
@@ -861,12 +1047,14 @@ async function startServer() {
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
         res.flushHeaders();
+        const numPredict = getNumericSetting('max_tokens_excuse', DEFAULT_MAX_TOKENS);
         await callOllama(prompt, true, (chunk) => {
           res.write(chunk);
-        });
+        }, numPredict);
         res.end();
       } else {
-        const response = await callOllama(prompt, false);
+        const numPredict = getNumericSetting('max_tokens_excuse', DEFAULT_MAX_TOKENS);
+        const response = await callOllama(prompt, false, undefined, numPredict);
         res.json({ result: response });
       }
     } catch (error) {
@@ -880,10 +1068,16 @@ async function startServer() {
       const { tasks, messages, budget, userScope } = req.body;
       const payload = JSON.stringify({ tasks, messages, budget });
       const prompt =
-        `Provide a concise executive summary of the recent club activity based on the following data. ` +
-        `The user viewing this has the following role/scope: ${JSON.stringify(userScope)}. ` +
-        `Only include information that would be relevant or accessible to someone with this scope. ` +
-        `Highlight progress, concerns, and upcoming deadlines. Keep it professional and scannable.\n\nData: ${payload}`;
+        `Provide a concise summary of the recent club activity based on the following data. ` +
+        `I have the following role/scope: ${JSON.stringify(userScope)}. ` +
+        `Only include information that would be relevant or accessible to me. ` +
+        `Highlight progress, concerns, and upcoming deadlines, if any. Keep it short and scannable, bullet point format. Even though there are IDs and programmatic details, do not include those in summary. ` +
+        `EXAMPLE: 1) Johanna messaged you in chat to see if you were up for a meeting.` +
+        `\n2) It looks like you have not completed the task "Design CAD model. It's due tomorrow."` +
+        `\n3) Bob finished the task "Build chassis."` +
+        `\n4) There are no outreach logs yet. Go see if you can fix that."` +
+
+        `\n\nData: ${payload}`;
 
       if (req.query.stream === 'true') {
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
@@ -891,12 +1085,14 @@ async function startServer() {
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
         res.flushHeaders();
+        const numPredict = getNumericSetting('max_tokens_summary', DEFAULT_MAX_TOKENS);
         await callOllama(prompt, true, (chunk) => {
           res.write(chunk);
-        });
+        }, numPredict);
         res.end();
       } else {
-        const response = await callOllama(prompt, false);
+        const numPredict = getNumericSetting('max_tokens_summary', DEFAULT_MAX_TOKENS);
+        const response = await callOllama(prompt, false, undefined, numPredict);
         res.json({ result: response });
       }
     } catch (error) {
@@ -932,6 +1128,360 @@ async function startServer() {
       res.json({ success: true });
     } catch (error) {
       console.error("Error deleting communication:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  // --- Code Management Endpoints ---
+  console.log("[Code Manager] Initializing code management endpoints...");
+  const codeRepoDir = path.join(__dirname, "code_repos");
+  
+  if (!fs.existsSync(codeRepoDir)) {
+    fs.mkdirSync(codeRepoDir, { recursive: true });
+  }
+  console.log("[Code Manager] Repository directory:", codeRepoDir);
+
+  // Helper to get team repo path
+  const getTeamRepoPath = (teamId: number) => path.join(codeRepoDir, `team_${teamId}`);
+  
+  // Helper to get git instance for team
+  const getGitInstance = (teamId: number): SimpleGit => {
+    const repoPath = getTeamRepoPath(teamId);
+    if (!fs.existsSync(repoPath)) {
+      fs.mkdirSync(repoPath, { recursive: true });
+    }
+    return simpleGit(repoPath);
+  };
+
+  // Initialize team repo
+  const initTeamRepo = async (teamId: number) => {
+    const git = getGitInstance(teamId);
+    try {
+      const isRepo = await git.checkIsRepo();
+      if (!isRepo) {
+        await git.init();
+        await git.addConfig('user.email', 'robot@team.local');
+        await git.addConfig('user.name', 'FTC Robot');
+      }
+    } catch (e) {
+      console.error("Error initializing repo:", e);
+    }
+  };
+
+  // POST: Get all code files for a team
+  app.get("/api/code/files/:teamId", (req, res) => {
+    try {
+      const teamId = parseInt(req.params.teamId, 10);
+      console.log("[Code Endpoint] GET /api/code/files/:teamId called with teamId:", teamId);
+      if (isNaN(teamId)) {
+        return res.status(400).json({ error: "Invalid team ID" });
+      }
+      const files = db.prepare("SELECT * FROM code_files WHERE team_id = ? ORDER BY updated_at DESC")
+        .all(teamId);
+      console.log("[Code Endpoint] Found", files.length, "files for team", teamId);
+      res.json(files);
+    } catch (error) {
+      console.error("Error fetching code files:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+  console.log("[Code Manager] GET /api/code/files/:teamId registered");
+
+  // POST: Create/upload code file
+  app.post("/api/code/files", (req, res) => {
+    try {
+      const { team_id, file_name, file_path, language = 'java', content, author_id } = req.body;
+      
+      console.log("[Code Endpoint] POST /api/code/files called with:", { team_id, file_name, file_path, language, author_id });
+      
+      if (!team_id || !file_name || !file_path || !author_id) {
+        console.log("[Code Endpoint] Missing required fields");
+        return res.status(400).json({ error: "Missing required fields: team_id, file_name, file_path, author_id" });
+      }
+
+      const now = new Date().toISOString();
+      const fileInfo = db.prepare(`
+        INSERT OR REPLACE INTO code_files (team_id, file_name, file_path, language, created_by, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(team_id, file_name, file_path, language, author_id, now, now);
+
+      const fileId = fileInfo.lastInsertRowid as number;
+
+      // Create initial commit to drafts
+      const hash = `draft_${Date.now()}`;
+      db.prepare(`
+        INSERT INTO code_commits (team_id, file_id, branch, author_id, message, content, hash, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(team_id, fileId, 'drafts', author_id, `Created ${file_name}`, content || '', hash, now);
+
+      console.log("[Code Endpoint] File created successfully. ID:", fileId);
+      res.json({ id: fileId, file_name, file_path, language });
+    } catch (error) {
+      console.error("Error creating code file:", error);
+      res.status(500).json({ error: "Internal server error", details: String(error) });
+    }
+  });
+  console.log("[Code Manager] POST /api/code/files registered");
+
+  // GET: Get code file content with history
+  app.get("/api/code/files/:fileId/content", (req, res) => {
+    try {
+      const fileId = parseInt(req.params.fileId, 10);
+      if (isNaN(fileId)) {
+        return res.status(400).json({ error: "Invalid file ID" });
+      }
+      const file = db.prepare("SELECT * FROM code_files WHERE id = ?").get(fileId) as any;
+      
+      if (!file) {
+        return res.status(404).json({ error: "File not found" });
+      }
+
+      const commits = db.prepare(`
+        SELECT cc.*, m.name as author_name 
+        FROM code_commits cc
+        LEFT JOIN members m ON cc.author_id = m.id
+        WHERE cc.file_id = ?
+        ORDER BY cc.created_at DESC
+      `).all(fileId);
+
+      // Get drafts content
+      const draftCommit = db.prepare(`
+        SELECT content FROM code_commits 
+        WHERE file_id = ? AND branch = 'drafts'
+        ORDER BY created_at DESC LIMIT 1
+      `).get(fileId) as any;
+
+      // Get main content
+      const mainCommit = db.prepare(`
+        SELECT content FROM code_commits 
+        WHERE file_id = ? AND branch = 'main'
+        ORDER BY created_at DESC LIMIT 1
+      `).get(fileId) as any;
+
+      res.json({
+        file,
+        content: {
+          drafts: draftCommit?.content || '',
+          main: mainCommit?.content || ''
+        },
+        commits
+      });
+    } catch (error) {
+      console.error("Error fetching code content:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  // POST: Save draft
+  app.post("/api/code/files/:fileId/draft", (req, res) => {
+    try {
+      const fileId = parseInt(req.params.fileId, 10);
+      if (isNaN(fileId)) {
+        return res.status(400).json({ error: "Invalid file ID" });
+      }
+      const { content, author_id } = req.body;
+      
+      const now = new Date().toISOString();
+      const hash = `draft_${Date.now()}`;
+
+      const info = db.prepare(`
+        INSERT INTO code_commits (team_id, file_id, branch, author_id, message, content, hash, created_at)
+        VALUES (
+          (SELECT team_id FROM code_files WHERE id = ?),
+          ?, 'drafts', ?, 'Auto-save draft', ?, ?, ?
+        )
+      `).run(fileId, fileId, author_id, content, hash, now);
+
+      // Update file's updated_at
+      db.prepare("UPDATE code_files SET updated_at = ? WHERE id = ?").run(now, fileId);
+
+      res.json({ success: true, id: info.lastInsertRowid });
+    } catch (error) {
+      console.error("Error saving draft:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  // POST: Commit to main (publish)
+  app.post("/api/code/files/:fileId/commit", async (req, res) => {
+    try {
+      const fileId = parseInt(req.params.fileId, 10);
+      if (isNaN(fileId)) {
+        return res.status(400).json({ error: "Invalid file ID" });
+      }
+      const { message, author_id } = req.body;
+
+      const file = db.prepare("SELECT * FROM code_files WHERE id = ?").get(fileId) as any;
+      if (!file) {
+        return res.status(404).json({ error: "File not found" });
+      }
+
+      // Get latest draft content
+      const draft = db.prepare(`
+        SELECT content FROM code_commits 
+        WHERE file_id = ? AND branch = 'drafts'
+        ORDER BY created_at DESC LIMIT 1
+      `).get(fileId) as any;
+
+      const now = new Date().toISOString();
+      const hash = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+      const info = db.prepare(`
+        INSERT INTO code_commits (team_id, file_id, branch, author_id, message, content, hash, created_at)
+        VALUES (?, ?, 'main', ?, ?, ?, ?, ?)
+      `).run(file.team_id, fileId, author_id, message || 'Commit to main', draft?.content || '', hash, now);
+
+      // Update file's updated_at
+      db.prepare("UPDATE code_files SET updated_at = ? WHERE id = ?").run(now, fileId);
+
+      // Broadcast to WebSocket clients
+      broadcast({
+        type: 'code_commit',
+        file_id: fileId,
+        team_id: file.team_id,
+        message: message || 'New commit',
+        hash,
+        timestamp: now
+      });
+
+      res.json({ success: true, hash });
+    } catch (error) {
+      console.error("Error committing code:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  // GET: Get commit history
+  app.get("/api/code/files/:fileId/history", (req, res) => {
+    try {
+      const fileId = parseInt(req.params.fileId, 10);
+      if (isNaN(fileId)) {
+        return res.status(400).json({ error: "Invalid file ID" });
+      }
+      const branch = (req.query.branch as string) || 'main';
+
+      const commits = db.prepare(`
+        SELECT cc.*, m.name as author_name 
+        FROM code_commits cc
+        LEFT JOIN members m ON cc.author_id = m.id
+        WHERE cc.file_id = ? AND cc.branch = ?
+        ORDER BY cc.created_at DESC
+      `).all(fileId, branch);
+
+      res.json(commits);
+    } catch (error) {
+      console.error("Error fetching commit history:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  // GET: Get specific commit
+  app.get("/api/code/commits/:commitId", (req, res) => {
+    try {
+      const commit = db.prepare(`
+        SELECT cc.*, m.name as author_name, cf.file_name
+        FROM code_commits cc
+        LEFT JOIN members m ON cc.author_id = m.id
+        LEFT JOIN code_files cf ON cc.file_id = cf.id
+        WHERE cc.id = ?
+      `).get(req.params.commitId) as any;
+
+      if (!commit) {
+        return res.status(404).json({ error: "Commit not found" });
+      }
+
+      res.json(commit);
+    } catch (error) {
+      console.error("Error fetching commit:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  // POST: Revert a commit by creating a new commit on the chosen branch (main or drafts)
+  app.post("/api/code/commits/:commitId/revert", (req, res) => {
+    try {
+      const commitId = parseInt(req.params.commitId, 10);
+      if (isNaN(commitId)) return res.status(400).json({ error: "Invalid commit ID" });
+
+      const { branch = 'main', author_id } = req.body as any;
+
+      const commit = db.prepare("SELECT * FROM code_commits WHERE id = ?").get(commitId) as any;
+      if (!commit) return res.status(404).json({ error: 'Commit not found' });
+
+      const file = db.prepare("SELECT * FROM code_files WHERE id = ?").get(commit.file_id) as any;
+      if (!file) return res.status(404).json({ error: 'File not found for commit' });
+
+      const now = new Date().toISOString();
+      const hash = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+      db.prepare(`
+        INSERT INTO code_commits (team_id, file_id, branch, author_id, message, content, hash, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(file.team_id, file.id, branch, author_id || null, `Revert to commit ${commit.hash}`, commit.content, hash, now);
+
+      db.prepare("UPDATE code_files SET updated_at = ? WHERE id = ?").run(now, file.id);
+
+      broadcast({
+        type: 'code_revert',
+        file_id: file.id,
+        team_id: file.team_id,
+        branch,
+        hash,
+        timestamp: now
+      });
+
+      res.json({ success: true, hash });
+    } catch (error) {
+      console.error('Error reverting commit:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // POST: Download code file
+  app.post("/api/code/files/:fileId/download", (req, res) => {
+    try {
+      const fileId = parseInt(req.params.fileId, 10);
+      if (isNaN(fileId)) {
+        return res.status(400).json({ error: "Invalid file ID" });
+      }
+      const { branch = 'main' } = req.body;
+
+      const file = db.prepare("SELECT * FROM code_files WHERE id = ?").get(fileId) as any;
+      if (!file) {
+        return res.status(404).json({ error: "File not found" });
+      }
+
+      const commit = db.prepare(`
+        SELECT content FROM code_commits 
+        WHERE file_id = ? AND branch = ?
+        ORDER BY created_at DESC LIMIT 1
+      `).get(fileId, branch) as any;
+
+      if (!commit) {
+        return res.status(404).json({ error: "No content found for this branch" });
+      }
+
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${file.file_name}"`);
+      res.send(commit.content);
+    } catch (error) {
+      console.error("Error downloading code:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  // DELETE: Delete code file
+  app.delete("/api/code/files/:fileId", (req, res) => {
+    try {
+      const fileId = parseInt(req.params.fileId, 10);
+      if (isNaN(fileId)) {
+        return res.status(400).json({ error: "Invalid file ID" });
+      }
+      db.prepare("DELETE FROM code_commits WHERE file_id = ?").run(fileId);
+      db.prepare("DELETE FROM code_files WHERE id = ?").run(fileId);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error deleting code file:", error);
       res.status(500).json({ error: "Internal server error" });
     }
   });

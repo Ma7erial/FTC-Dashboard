@@ -31,8 +31,10 @@ import {
   UserCircle,
   Zap,
   Trash2,
-  Camera,
-  FileText
+  FileUp,
+  FileText,
+  Bolt,
+  Code2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
@@ -46,9 +48,16 @@ import { format } from 'date-fns';
 
 import { Team, Member, AttendanceRecord, Task, BudgetItem, OutreachEvent, Communication } from './types';
 import { fetchFTCNews, streamFTCNews, getAttendanceInsights, streamAttendanceInsights, checkExcuse, streamCheckExcuse, getActivitySummary, streamActivitySummary } from './services/aiService';
+import { CodeView } from './components/CodeView';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
+}
+
+// Helper to get CSS variable values
+function getCSSVariable(name: string): string {
+  if (typeof window === 'undefined') return '';
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '';
 }
 
 // --- Components ---
@@ -69,20 +78,32 @@ const Card = ({ children, className, title, subtitle, icon: Icon }: any) => (
 );
 
 const Button = ({ children, className, variant = 'primary', ...props }: any) => {
-  const variants = {
-    primary: 'bg-accent text-primary hover:bg-accent-hover font-bold',
+  const accentColor = getCSSVariable('--color-accent');
+  const primaryColor = getCSSVariable('--color-primary');
+  
+  const variants: any = {
+    primary: {
+      className: 'text-primary font-bold hover:brightness-90',
+      style: { backgroundColor: accentColor || '#fbbf24', color: primaryColor || '#0f172a' }
+    },
     secondary: 'bg-slate-800 text-white hover:bg-slate-700',
-    outline: 'border border-accent/50 text-accent hover:bg-accent/10',
+    outline: {
+      className: 'text-accent hover:opacity-80 border border-current font-bold',
+    },
     ghost: 'text-slate-400 hover:text-white hover:bg-white/5'
   };
+  
+  const variantConfig = variants[variant as keyof typeof variants];
+  const isObject = typeof variantConfig === 'object' && !Array.isArray(variantConfig);
   
   return (
     <button 
       className={cn(
         "px-4 py-2 rounded-xl transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50", 
-        variants[variant as keyof typeof variants],
+        isObject ? variantConfig.className : variantConfig,
         className
       )}
+      style={isObject ? variantConfig.style : undefined}
       {...props}
     >
       {children}
@@ -145,6 +166,37 @@ export default function App() {
   const [insights, setInsights] = useState<string>("");
   const [summary, setSummary] = useState<string>("");
   const [loading, setLoading] = useState(false);
+  const [isAiLoading, setIsAiLoading] = useState(false);
+  const [aiLoadingTarget, setAiLoadingTarget] = useState<string | null>(null);
+  const [colorVersion, setColorVersion] = useState(0);
+
+  // --- Components ---
+
+  const ThinkingIndicator = () => {
+    const text = "Thinking...";
+    return (
+      <div className="flex gap-1 items-center">
+        {text.split('').map((char, i) => (
+          <motion.span
+            key={i}
+            animate={{ 
+              opacity: [0.3, 1, 0.3],
+              scale: [0.95, 1.05, 0.95]
+            }}
+            transition={{
+              duration: 2,
+              repeat: Infinity,
+              delay: i * 0.15,
+              ease: "easeInOut"
+            }}
+            className="text-accent font-bold"
+          >
+            {char}
+          </motion.span>
+        ))}
+      </div>
+    );
+  };
 
   // helper that uses our service; can force a refresh bypassing the 24h cache
   // this implementation streams the response so the UI updates as tokens arrive
@@ -165,9 +217,16 @@ export default function App() {
       }
     }
 
+    setIsAiLoading(true);
+    setAiLoadingTarget('news');
+    setNews(""); // Clear old news to show "Thinking..."
     try {
       let aggregate = '';
+      let receivedFirstChunk = false;
       await streamFTCNews(force, (chunk) => {
+        if (!receivedFirstChunk) {
+          receivedFirstChunk = true;
+        }
         aggregate += chunk;
         setNews(aggregate);
       });
@@ -178,11 +237,41 @@ export default function App() {
     } catch (err) {
       console.error('Error updating news:', err);
       setNews('Failed to fetch latest news. Please check your connection.');
+    } finally {
+      setIsAiLoading(false);
+      setAiLoadingTarget(null);
     }
   };
 
   // WebSocket
   const [socket, setSocket] = useState<WebSocket | null>(null);
+
+  // Apply custom colors
+  useEffect(() => {
+    if (isLoggedIn && currentUser) {
+      const myTeam = teams.find(t => t.id === currentUser.team_id);
+      
+      const accent = currentUser.accent_color || myTeam?.accent_color || '#fbbf24';
+      const primary = currentUser.primary_color || myTeam?.primary_color || '#0f172a';
+      const text = currentUser.text_color || myTeam?.text_color || '#f1f5f9'; // slate-100 default
+
+      const root = document.documentElement;
+      root.style.setProperty('--color-accent', accent);
+      root.style.setProperty('--color-primary', primary);
+      root.style.setProperty('--color-text-base', text);
+      
+      // Secondary color is usually a slightly lighter version of primary
+      // For simplicity, we can just use the same or a slightly transparent version
+      root.style.setProperty('--color-secondary', primary + 'CC'); // Adding transparency
+    } else {
+      // Reset to defaults
+      const root = document.documentElement;
+      root.style.setProperty('--color-accent', '#fbbf24');
+      root.style.setProperty('--color-primary', '#0f172a');
+      root.style.setProperty('--color-text-base', '#f1f5f9');
+      root.style.setProperty('--color-secondary', '#1e293b');
+    }
+  }, [currentUser, teams, isLoggedIn]);
 
   useEffect(() => {
     fetch('/api/members').then(res => res.json()).then(setMembers);
@@ -205,6 +294,10 @@ export default function App() {
         const msg = JSON.parse(event.data);
         if (msg.type === 'chat') {
           setMessages(prev => [...prev, msg]);
+        } else if (msg.type === 'message_deleted') {
+          setMessages(prev => 
+            prev.map(m => m.id === msg.id ? { ...m, deleted_at: msg.deleted_at } : m)
+          );
         } else if (msg.type === 'notification') {
           if (currentUser && msg.notification.user_id === currentUser.id) {
             setNotifications(prev => [msg.notification, ...prev]);
@@ -230,6 +323,8 @@ export default function App() {
 
   const updateInsights = async () => {
     if (attendance.length === 0 || members.length === 0) return;
+    setIsAiLoading(true);
+    setAiLoadingTarget('insights');
     setInsights("");
     let aggInsights = '';
     try {
@@ -240,6 +335,64 @@ export default function App() {
     } catch (err) {
       console.error('Error updating insights:', err);
       setInsights('Failed to generate insights.');
+    } finally {
+      setIsAiLoading(false);
+      setAiLoadingTarget(null);
+    }
+  };
+
+  const updateSummary = async (force: boolean = false) => {
+    const CACHE_KEY = 'ftcSummaryCache';
+    const TS_KEY = 'ftcSummaryTimestamp';
+    const COUNT_KEY = 'ftcSummaryItemCount';
+
+    const currentItemCount = (tasks?.length || 0) + (messages?.length || 0) + (budget?.length || 0);
+
+    if (!force && typeof localStorage !== 'undefined') {
+      const cached = localStorage.getItem(CACHE_KEY);
+      const ts = localStorage.getItem(TS_KEY);
+      const prevCount = parseInt(localStorage.getItem(COUNT_KEY) || '0', 10);
+      
+      if (cached && ts) {
+        const age = Date.now() - parseInt(ts, 10);
+        const newItemCount = currentItemCount - prevCount;
+        
+        // Cache for 10 minutes unless 3+ new items arrived
+        if (age < 10 * 60 * 1000 && newItemCount < 3) {
+          setSummary(cached);
+          return;
+        }
+      }
+    }
+
+    if (!currentUser) return;
+
+    setIsAiLoading(true);
+    setAiLoadingTarget('summary');
+    setSummary("");
+    try {
+      let aggSummary = '';
+      await streamActivitySummary({ 
+        tasks, 
+        messages, 
+        budget,
+        userScope: { role: currentUser.role, is_board: currentUser.is_board, scopes: currentUser.scopes }
+      }, (chunk) => {
+        aggSummary += chunk;
+        setSummary(aggSummary);
+      });
+
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(CACHE_KEY, aggSummary);
+        localStorage.setItem(TS_KEY, Date.now().toString());
+        localStorage.setItem(COUNT_KEY, currentItemCount.toString());
+      }
+    } catch (err) {
+      console.error('Error updating summary:', err);
+      setSummary('Failed to generate summary.');
+    } finally {
+      setIsAiLoading(false);
+      setAiLoadingTarget(null);
     }
   };
 
@@ -247,7 +400,7 @@ export default function App() {
     setLoading(true);
     try {
       const fetchJson = async (url: string) => {
-        const res = await fetch(url);
+        const res = await fetch(url, { cache: 'no-store' });
         if (!res.ok) {
           console.warn(`Fetch failed for ${url}: ${res.status}`);
           return null;
@@ -276,9 +429,11 @@ export default function App() {
 
       if (Array.isArray(t)) setTeams(t);
       if (Array.isArray(m)) {
+        console.log(`[Data Fetch] Received ${m.length} members`);
         setMembers(m);
         if (currentUser) {
           const updatedUser = m.find((member: any) => member.id === currentUser.id);
+          console.log(`[Data Fetch] Updating currentUser:`, updatedUser);
           if (updatedUser) setCurrentUser(updatedUser);
         }
       }
@@ -304,16 +459,7 @@ export default function App() {
       updateNews();
       // Insights and Summary are now manual or context-specific
       if (currentUser) {
-        let aggSummary = '';
-        streamActivitySummary({ 
-          tasks: tk, 
-          messages: msgs, 
-          budget: b,
-          userScope: { role: currentUser.role, is_board: currentUser.is_board, scopes: currentUser.scopes }
-        }, (chunk) => {
-          aggSummary += chunk;
-          setSummary(aggSummary);
-        });
+        updateSummary();
       }
     } catch (err) {
       console.error("Error in fetchData:", err);
@@ -419,6 +565,7 @@ export default function App() {
     { id: 'tasks', label: 'Tasks', icon: CheckSquare },
     { id: 'budget', label: 'Budget', icon: Wallet, scope: 'budget' },
     { id: 'outreach', label: 'Outreach', icon: Globe },
+    { id: 'code', label: 'Code', icon: Code2 },
     { id: 'comm', label: 'Communication', icon: Mail },
     { id: 'chat', label: 'Messaging', icon: MessageSquare },
     { id: 'scout', label: 'AI Scout', icon: Newspaper },
@@ -431,9 +578,12 @@ export default function App() {
       teams, members, attendance, tasks, budget, outreach, communications, 
       messages, settings, hiddenDates, currentUser, onRefresh: fetchData, setLoading,
       insights, news, summary, socket, hasScope,
+      isAiLoading, setIsAiLoading, ThinkingIndicator, aiLoadingTarget,
+      colorVersion, setColorVersion,
       // give child views a way to explicitly refresh the AI news cache
       refreshNews: () => updateNews(true),
-      updateInsights
+      updateInsights,
+      updateSummary: () => updateSummary(true)
     };
     switch (activeTab) {
       case 'dashboard': return <DashboardView {...viewProps} data={{ attendance, tasks, budget, outreach, insights, news, summary, members }} />;
@@ -442,6 +592,7 @@ export default function App() {
       case 'tasks': return <TasksView {...viewProps} />;
       case 'budget': return <BudgetView {...viewProps} />;
       case 'outreach': return <OutreachView {...viewProps} />;
+      case 'code': return <CodeView {...viewProps} />;
       case 'comm': return <CommunicationView {...viewProps} />;
       case 'chat': return <ChatView {...viewProps} />;
       case 'scout': return <ScoutView {...viewProps} />;
@@ -458,11 +609,11 @@ export default function App() {
           <Card className="w-full max-w-md p-8">
             <div className="flex flex-col items-center gap-4 mb-8">
               <div className="w-16 h-16 bg-accent rounded-2xl flex items-center justify-center gold-glow">
-                <Award className="text-primary w-10 h-10" />
+                <Bolt className="text-primary w-10 h-10" />
               </div>
-              <h1 className="text-3xl font-display font-bold text-white">FTC Nexus</h1>
+              <h1 className="text-3xl font-display font-bold text-white">FTC Dashboard</h1>
               <p className="text-slate-400 text-center">
-                {needsSetup ? "Set your new password to continue" : "Sign in to manage your club"}
+                {needsSetup ? "Set your new password to continue" : "Sign in to access club data."}
               </p>
             </div>
 
@@ -506,30 +657,35 @@ export default function App() {
       <motion.aside 
         initial={false}
         animate={{ 
-          width: isSidebarOpen ? 280 : 80,
-          x: (window.innerWidth <= 768 && !isSidebarOpen) ? -280 : 0
+          width: isSidebarOpen ? 280 : 80
         }}
+        transition={{ type: "spring", stiffness: 300, damping: 30 }}
         className={cn(
-          "bg-secondary border-r border-white/5 flex flex-col z-40 transition-all duration-300",
-          window.innerWidth <= 768 ? "fixed inset-y-0 left-0" : "relative"
+          "bg-secondary border-r border-white/5 flex flex-col z-40",
+          window.innerWidth <= 768 ? "fixed inset-y-0 left-0 shadow-xl" : "relative"
         )}
+        style={{
+          transform: window.innerWidth <= 768 && !isSidebarOpen ? 'translateX(-100%)' : 'translateX(0)',
+          transition: 'transform 0.3s ease-in-out'
+        }}
       >
-        <div className="p-6 flex items-center gap-3">
-          <div className="w-10 h-10 bg-accent rounded-xl flex items-center justify-center gold-glow">
-            <Award className="text-primary w-6 h-6" />
+        <div className="p-4 sm:p-6 flex items-center gap-3 flex-shrink-0">
+          <div className="w-10 h-10 bg-accent rounded-xl flex items-center justify-center gold-glow flex-shrink-0">
+            <Bolt className="text-primary w-6 h-6" />
           </div>
           {isSidebarOpen && (
             <motion.h1 
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              className="text-xl font-display font-bold text-white whitespace-nowrap"
+              transition={{ delay: 0.1 }}
+              className="text-lg sm:text-xl font-display font-bold text-white whitespace-nowrap"
             >
-              FTC Nexus
+              FTC Dashboard
             </motion.h1>
           )}
         </div>
 
-        <nav className="flex-1 px-4 space-y-2 mt-4">
+        <nav className="flex-1 px-3 sm:px-4 space-y-1 sm:space-y-2 mt-4 overflow-y-auto custom-scrollbar">
           {navItems.map((item) => {
             const isLocked = item.scope && !hasScope(item.scope);
             return (
@@ -550,11 +706,11 @@ export default function App() {
           })}
         </nav>
 
-        <div className="p-4 border-t border-white/5">
-          <div className="flex items-center gap-3 p-3 mb-2">
+        <div className="p-3 sm:p-4 border-t border-white/5 flex-shrink-0 space-y-2">
+          <div className="flex items-center gap-3 p-2 sm:p-3">
             <button 
               onClick={() => setActiveTab('profile')}
-              className="w-8 h-8 rounded-full bg-accent flex items-center justify-center text-primary font-bold text-xs hover:ring-2 hover:ring-accent-hover transition-all"
+              className="w-8 h-8 rounded-full bg-accent flex items-center justify-center text-primary font-bold text-xs hover:ring-2 hover:ring-accent-hover transition-all flex-shrink-0"
             >
               {currentUser?.name.charAt(0)}
             </button>
@@ -569,28 +725,30 @@ export default function App() {
           </div>
           <button 
             onClick={() => setIsSidebarOpen(!isSidebarOpen)}
-            className="w-full flex items-center gap-3 p-3 text-slate-400 hover:text-white"
+            className="w-full flex items-center gap-3 p-2 sm:p-3 text-slate-400 hover:text-white rounded-lg hover:bg-white/5 transition-colors"
+            title={isSidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
           >
-            {isSidebarOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
-            {isSidebarOpen && <span>Collapse</span>}
+            {isSidebarOpen ? <X className="w-5 h-5 flex-shrink-0" /> : <Menu className="w-5 h-5 flex-shrink-0" />}
+            {isSidebarOpen && <span className="text-sm">Collapse</span>}
           </button>
         </div>
       </motion.aside>
 
       {/* Main Content */}
-      <main className="flex-1 overflow-y-auto bg-primary custom-scrollbar relative">
-        <header className="sticky top-0 z-20 glass px-4 sm:px-8 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-4">
+      <main className="flex-1 overflow-y-auto bg-primary custom-scrollbar relative h-screen">
+        <header className="sticky top-0 z-20 glass px-4 sm:px-6 lg:px-8 py-3 sm:py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3 sm:gap-4 min-w-0">
             <button 
               onClick={() => setIsSidebarOpen(!isSidebarOpen)}
-              className="p-2 text-slate-400 hover:text-white sm:hidden"
+              className="p-2 text-slate-400 hover:text-white md:hidden flex-shrink-0"
+              title="Toggle sidebar"
             >
               <Menu className="w-6 h-6" />
             </button>
-            <h2 className="text-xl sm:text-2xl font-display font-bold text-white capitalize">{activeTab.replace('-', ' ')}</h2>
+            <h2 className="text-lg sm:text-xl md:text-2xl font-display font-bold text-white capitalize truncate">{activeTab.replace('-', ' ')}</h2>
           </div>
           
-          <div className="flex items-center gap-2 sm:gap-4">
+          <div className="flex items-center gap-1 sm:gap-2 md:gap-4 flex-shrink-0">
             <div className="relative">
               <button 
                 onClick={() => {
@@ -651,7 +809,7 @@ export default function App() {
           </div>
         </header>
 
-        <div className="p-8">
+        <div className="p-4 sm:p-6 lg:p-8 flex flex-col flex-1 min-h-0 overflow-y-auto custom-scrollbar">
           <AnimatePresence mode="wait">
             <motion.div
               key={activeTab}
@@ -659,6 +817,7 @@ export default function App() {
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -10 }}
               transition={{ duration: 0.2 }}
+              className="flex flex-col flex-1 min-h-0"
             >
               {loading ? (
                 <div className="flex flex-col items-center justify-center h-64 gap-4">
@@ -676,7 +835,7 @@ export default function App() {
 
 // --- View Components ---
 
-function DashboardView({ data, currentUser, onRefresh, settings, setLoading, insights, updateInsights }: any) {
+function DashboardView({ data, currentUser, onRefresh, settings, setLoading, insights, updateInsights, isAiLoading, setIsAiLoading, ThinkingIndicator, updateSummary, colorVersion }: any) {
   const [showOut, setShowOut] = useState(false);
   const [outReason, setOutReason] = useState('');
 
@@ -690,9 +849,11 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading, ins
       let aiNote = '';
       
       if (status === 'O' && reason) {
+        setIsAiLoading(true);
         await streamCheckExcuse(reason, settings.excuse_criteria, (chunk) => {
           aiNote += chunk;
         });
+        setIsAiLoading(false);
         const isExcused = aiNote.toUpperCase().includes("EXCUSED") && !aiNote.toUpperCase().includes("UNEXCUSED");
         finalStatus = isExcused ? 'E' : 'U';
       }
@@ -737,12 +898,16 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading, ins
       date: format(new Date(date), 'MMM dd'),
       count: data.attendance?.filter((r: any) => r.date === date && (r.status === 'P' || r.status === 'L')).length || 0
     }));
-  }, [data.attendance]);
+  }, [data.attendance, colorVersion]);
+
+  // Get dynamic colors for charts
+  const accentColor = getCSSVariable('--color-accent') || '#fbbf24';
+  const secondaryColor = getCSSVariable('--color-secondary') || '#1e293b';
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 pb-20">
+    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-6 pb-8 sm:pb-20">
       <Card title="Club Health" icon={TrendingUp} className="lg:col-span-3">
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4">
           <div className="p-4 bg-white/5 rounded-2xl border border-white/5">
             <p className="text-xs text-slate-400 uppercase font-bold mb-1">Attendance {todayAttendance.length > 0 ? '(Today)' : '(Avg)'}</p>
             <p className="text-2xl sm:text-3xl font-display font-bold text-accent">{attendanceRate}%</p>
@@ -764,10 +929,10 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading, ins
               <XAxis dataKey="date" stroke="#94a3b8" fontSize={10} axisLine={false} tickLine={false} />
               <YAxis stroke="#94a3b8" fontSize={10} axisLine={false} tickLine={false} />
               <Tooltip 
-                contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #ffffff20', borderRadius: '12px' }}
-                itemStyle={{ color: '#fbbf24' }}
+                contentStyle={{ backgroundColor: secondaryColor, border: '1px solid #ffffff20', borderRadius: '12px' }}
+                itemStyle={{ color: accentColor }}
               />
-              <Line type="monotone" dataKey="count" stroke="#fbbf24" strokeWidth={3} dot={{ fill: '#fbbf24', strokeWidth: 2, r: 4 }} activeDot={{ r: 6 }} />
+              <Line type="monotone" dataKey="count" stroke={accentColor} strokeWidth={3} dot={{ fill: accentColor, strokeWidth: 2, r: 4 }} activeDot={{ r: 6 }} />
             </LineChart>
           </ResponsiveContainer>
         </div>
@@ -778,12 +943,14 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading, ins
               <Zap className="w-5 h-5 text-accent" />
               <h4 className="text-sm font-bold text-white uppercase tracking-wider">Attendance Insights</h4>
             </div>
-            <Button variant="outline" size="sm" onClick={() => updateInsights()}>
+            <Button variant="outline" size="sm" onClick={() => updateInsights()} disabled={isAiLoading}>
               <Zap className="w-3 h-3 mr-1" /> {insights ? "Refresh Insights" : "Generate Insights"}
             </Button>
           </div>
           <div className="text-sm text-slate-300 leading-relaxed prose prose-invert max-w-none">
-            {insights ? (
+            {isAiLoading && !insights ? (
+              <ThinkingIndicator />
+            ) : insights ? (
               <Markdown>{insights}</Markdown>
             ) : (
               <p className="text-xs text-slate-500 italic">Click generate to analyze attendance patterns and club health.</p>
@@ -820,14 +987,14 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading, ins
             <div className="space-y-3">
               <p className="text-xs text-slate-400">Mark your status for today's session:</p>
               <div className="grid grid-cols-2 gap-2">
-                <Button onClick={() => handleSelfReport('P')} variant="outline" className="border-emerald-500/50 text-emerald-400 hover:bg-emerald-500/10">
+                <Button onClick={() => handleSelfReport('P')} variant="outline" className="border-emerald-500/50 text-emerald-400 hover:bg-emerald-500/10" disabled={isAiLoading}>
                   <CheckSquare className="w-4 h-4" /> I'm Here
                 </Button>
-                <Button onClick={() => handleSelfReport('L')} variant="outline" className="border-amber-500/50 text-amber-400 hover:bg-amber-500/10">
+                <Button onClick={() => handleSelfReport('L')} variant="outline" className="border-amber-500/50 text-amber-400 hover:bg-amber-500/10" disabled={isAiLoading}>
                   <Clock className="w-4 h-4" /> I'm Late
                 </Button>
               </div>
-              <Button onClick={() => setShowOut(true)} variant="secondary" className="w-full">
+              <Button onClick={() => setShowOut(true)} variant="secondary" className="w-full" disabled={isAiLoading}>
                 <LogOut className="w-4 h-4" /> Log Absence
               </Button>
             </div>
@@ -853,8 +1020,18 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading, ins
       </Card>
 
       <Card title="AI Activity Summary" icon={Zap} className="md:col-span-2">
+        <div className="flex items-center justify-between mb-4 border-b border-white/5 pb-2">
+          <p className="text-[10px] text-slate-500 uppercase font-bold tracking-widest">Recent Activity</p>
+          <Button variant="ghost" size="sm" className="h-6 text-[10px] text-accent px-2" onClick={updateSummary} disabled={isAiLoading}>
+            <Clock className="w-3 h-3 mr-1" /> Refresh
+          </Button>
+        </div>
         <div className="text-sm text-slate-300 leading-relaxed prose prose-invert max-h-[400px] overflow-y-auto custom-scrollbar pr-2">
-          <Markdown>{data.summary || "Generating activity summary..."}</Markdown>
+          {isAiLoading && !data.summary ? (
+            <ThinkingIndicator />
+          ) : (
+            <Markdown>{data.summary || "No summary available."}</Markdown>
+          )}
         </div>
       </Card>
 
@@ -864,14 +1041,16 @@ function DashboardView({ data, currentUser, onRefresh, settings, setLoading, ins
             <div className="space-y-4">
               <p className="text-sm text-slate-400">Let the team know why you'll be missing today's session.</p>
               <textarea 
-                className="w-full bg-primary border border-white/10 rounded-xl px-4 py-2 text-white focus:outline-none focus:border-accent/50 transition-colors h-24"
+                className="w-full bg-primary border border-white/10 rounded-xl px-4 py-2 text-white focus:outline-none focus:border-accent/50 transition-colors h-24 disabled:opacity-50"
                 placeholder="Reason for absence..."
                 value={outReason}
                 onChange={(e) => setOutReason(e.target.value)}
+                disabled={isAiLoading}
               />
+              {isAiLoading && <div className="flex justify-center"><ThinkingIndicator /></div>}
               <div className="flex gap-3 justify-end">
-                <Button variant="secondary" onClick={() => setShowOut(false)}>Cancel</Button>
-                <Button onClick={() => handleSelfReport('O', outReason)}>Submit</Button>
+                <Button variant="secondary" onClick={() => setShowOut(false)} disabled={isAiLoading}>Cancel</Button>
+                <Button onClick={() => handleSelfReport('O', outReason)} disabled={isAiLoading || !outReason}>Submit</Button>
               </div>
             </div>
           </Card>
@@ -886,7 +1065,7 @@ function TeamsView({ teams, members, onRefresh, currentUser, hasScope }: any) {
   const [showAddMember, setShowAddMember] = useState(false);
   const [editingTeam, setEditingTeam] = useState<any>(null);
   const [editingMember, setEditingMember] = useState<any>(null);
-  const [newTeam, setNewTeam] = useState({ name: '', number: '' });
+  const [newTeam, setNewTeam] = useState<any>({ name: '', number: '', accent_color: '', primary_color: '', text_color: '' });
   const [newMember, setNewMember] = useState({ team_id: '', name: '', role: '', email: '', is_board: false, scopes: [] });
 
   const isAdmin = hasScope('admin');
@@ -911,7 +1090,7 @@ function TeamsView({ teams, members, onRefresh, currentUser, hasScope }: any) {
     });
     setShowAddTeam(false);
     setEditingTeam(null);
-    setNewTeam({ name: '', number: '' });
+    setNewTeam({ name: '', number: '', accent_color: '', primary_color: '', text_color: '' });
     onRefresh();
   };
 
@@ -953,13 +1132,16 @@ function TeamsView({ teams, members, onRefresh, currentUser, hasScope }: any) {
   };
 
   return (
-    <div className="space-y-8">
-      <div className="flex items-center justify-between">
-        <h3 className="text-xl font-display font-bold text-white">Teams</h3>
-        <Button onClick={() => setShowAddTeam(true)}><Plus className="w-4 h-4" /> Add Team</Button>
+    <div className="space-y-4 sm:space-y-8">
+      <div className="flex flex-col sm:flex-row gap-3 sm:gap-0 sm:items-center sm:justify-between">
+        <h3 className="text-lg sm:text-xl font-display font-bold text-white">Teams</h3>
+        <Button onClick={() => {
+          setNewTeam({ name: '', number: '', accent_color: '', primary_color: '', text_color: '' });
+          setShowAddTeam(true);
+        }}><Plus className="w-4 h-4" /> Add Team</Button>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6">
         {teams.map((team: any) => (
           <Card key={team.id} title={`${team.name} #${team.number}`} icon={Award}>
             <div className="flex flex-col h-full">
@@ -972,6 +1154,16 @@ function TeamsView({ teams, members, onRefresh, currentUser, hasScope }: any) {
                     </div>
                   ))}
                 </div>
+                {(team.accent_color || team.primary_color) && (
+                  <div className="pt-2">
+                    <p className="text-[10px] text-slate-500 uppercase font-bold mb-1">Team Branding</p>
+                    <div className="flex gap-2">
+                      {team.accent_color && <div className="w-4 h-4 rounded-full border border-white/10" style={{ backgroundColor: team.accent_color }} title="Accent" />}
+                      {team.primary_color && <div className="w-4 h-4 rounded-full border border-white/10" style={{ backgroundColor: team.primary_color }} title="Primary" />}
+                      {team.text_color && <div className="w-4 h-4 rounded-full border border-white/10" style={{ backgroundColor: team.text_color }} title="Text" />}
+                    </div>
+                  </div>
+                )}
               </div>
               {isAdmin && (
                 <div className="flex gap-2 pt-4 border-t border-white/5">
@@ -981,7 +1173,13 @@ function TeamsView({ teams, members, onRefresh, currentUser, hasScope }: any) {
                     className="flex-1 h-8 text-[10px]"
                     onClick={() => {
                       setEditingTeam(team);
-                      setNewTeam({ name: team.name, number: team.number });
+                      setNewTeam({ 
+                        name: team.name, 
+                        number: team.number,
+                        accent_color: team.accent_color || '',
+                        primary_color: team.primary_color || '',
+                        text_color: team.text_color || ''
+                      });
                       setShowAddTeam(true);
                     }}
                   >
@@ -1002,13 +1200,13 @@ function TeamsView({ teams, members, onRefresh, currentUser, hasScope }: any) {
         ))}
       </div>
 
-      <div className="flex items-center justify-between mt-12">
-        <h3 className="text-xl font-display font-bold text-white">All Members</h3>
+      <div className="flex flex-col sm:flex-row gap-3 sm:gap-0 sm:items-center sm:justify-between mt-12">
+        <h3 className="text-lg sm:text-xl font-display font-bold text-white">All Members</h3>
         <Button onClick={() => setShowAddMember(true)}><Plus className="w-4 h-4" /> Add Member</Button>
       </div>
 
-      <div className="glass rounded-2xl overflow-hidden">
-        <table className="w-full text-left">
+      <div className="glass rounded-2xl overflow-x-auto custom-scrollbar">
+        <table className="w-full text-left text-sm">
           <thead className="bg-white/5 border-b border-white/10">
             <tr>
               <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase">Name</th>
@@ -1103,8 +1301,27 @@ function TeamsView({ teams, members, onRefresh, currentUser, hasScope }: any) {
             <div className="space-y-4">
               <Input placeholder="Team Name (e.g. CyberKnights)" value={newTeam.name} onChange={(e: any) => setNewTeam({...newTeam, name: e.target.value})} />
               <Input placeholder="Team Number (e.g. 12345)" value={newTeam.number} onChange={(e: any) => setNewTeam({...newTeam, number: e.target.value})} />
+              
+              <div className="pt-2">
+                <p className="text-xs font-bold text-slate-400 uppercase mb-3">Team Branding (Default for members)</p>
+                <div className="grid grid-cols-1 gap-4">
+                  <div className="flex items-center gap-3">
+                    <input type="color" className="w-8 h-8 rounded bg-transparent border-none cursor-pointer" value={newTeam.accent_color || '#fbbf24'} onChange={(e) => setNewTeam({...newTeam, accent_color: e.target.value})} />
+                    <Input placeholder="Accent Color (Yellow)" value={newTeam.accent_color} onChange={(e: any) => setNewTeam({...newTeam, accent_color: e.target.value})} />
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <input type="color" className="w-8 h-8 rounded bg-transparent border-none cursor-pointer" value={newTeam.primary_color || '#0f172a'} onChange={(e) => setNewTeam({...newTeam, primary_color: e.target.value})} />
+                    <Input placeholder="Interface Color (Navy)" value={newTeam.primary_color} onChange={(e: any) => setNewTeam({...newTeam, primary_color: e.target.value})} />
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <input type="color" className="w-8 h-8 rounded bg-transparent border-none cursor-pointer" value={newTeam.text_color || '#f1f5f9'} onChange={(e) => setNewTeam({...newTeam, text_color: e.target.value})} />
+                    <Input placeholder="Text Color" value={newTeam.text_color} onChange={(e: any) => setNewTeam({...newTeam, text_color: e.target.value})} />
+                  </div>
+                </div>
+              </div>
+
               <div className="flex gap-3 justify-end">
-                <Button variant="secondary" onClick={() => { setShowAddTeam(false); setEditingTeam(null); setNewTeam({ name: '', number: '' }); }}>Cancel</Button>
+                <Button variant="secondary" onClick={() => { setShowAddTeam(false); setEditingTeam(null); setNewTeam({ name: '', number: '', accent_color: '', primary_color: '', text_color: '' }); }}>Cancel</Button>
                 <Button onClick={handleAddTeam}>{editingTeam ? "Save Changes" : "Create Team"}</Button>
               </div>
             </div>
@@ -1168,7 +1385,7 @@ function TeamsView({ teams, members, onRefresh, currentUser, hasScope }: any) {
   );
 }
 
-function AttendanceView({ members, attendance, onRefresh, setLoading, hasScope, insights, updateInsights }: any) {
+function AttendanceView({ members, attendance, onRefresh, setLoading, hasScope, insights, updateInsights, isAiLoading, ThinkingIndicator }: any) {
   const [activeSubTab, setActiveSubTab] = useState<'grid' | 'history' | 'summary'>('grid');
   const [sessions, setSessions] = useState<string[]>([]);
   const [summary, setSummary] = useState<any[]>([]);
@@ -1235,9 +1452,9 @@ function AttendanceView({ members, attendance, onRefresh, setLoading, hasScope, 
   };
 
   const renderGrid = () => (
-    <div className="glass rounded-2xl overflow-hidden">
+    <div className="glass rounded-2xl overflow-x-auto custom-scrollbar">
       <div className="overflow-x-auto">
-        <table className="w-full text-left border-collapse">
+        <table className="w-full text-left text-sm border-collapse">
           <thead>
             <tr className="bg-white/5 border-b border-white/10">
               <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase sticky left-0 bg-[#0f172a] z-10 min-w-[150px]">Member</th>
@@ -1288,23 +1505,23 @@ function AttendanceView({ members, attendance, onRefresh, setLoading, hasScope, 
   );
 
   return (
-    <div className="space-y-6">
-      <div className="flex gap-2 p-1 bg-white/5 rounded-xl border border-white/10 w-fit">
+    <div className="space-y-4 sm:space-y-6">
+      <div className="flex gap-1 sm:gap-2 p-1 bg-white/5 rounded-xl border border-white/10 w-full sm:w-fit overflow-x-auto custom-scrollbar">
         <button 
           onClick={() => setActiveSubTab('grid')}
-          className={cn("px-4 py-2 rounded-lg text-sm font-bold transition-all", activeSubTab === 'grid' ? "bg-accent text-primary shadow-lg" : "text-slate-400 hover:text-white")}
+          className={cn("px-2 sm:px-4 py-2 rounded-lg text-xs sm:text-sm font-bold transition-all whitespace-nowrap", activeSubTab === 'grid' ? "bg-accent text-primary shadow-lg" : "text-slate-400 hover:text-white")}
         >
           Attendance Grid
         </button>
         <button 
           onClick={() => setActiveSubTab('history')}
-          className={cn("px-4 py-2 rounded-lg text-sm font-bold transition-all", activeSubTab === 'history' ? "bg-accent text-primary shadow-lg" : "text-slate-400 hover:text-white")}
+          className={cn("px-2 sm:px-4 py-2 rounded-lg text-xs sm:text-sm font-bold transition-all whitespace-nowrap", activeSubTab === 'history' ? "bg-accent text-primary shadow-lg" : "text-slate-400 hover:text-white")}
         >
           History
         </button>
         <button 
           onClick={() => setActiveSubTab('summary')}
-          className={cn("px-4 py-2 rounded-lg text-sm font-bold transition-all", activeSubTab === 'summary' ? "bg-accent text-primary shadow-lg" : "text-slate-400 hover:text-white")}
+          className={cn("px-2 sm:px-4 py-2 rounded-lg text-xs sm:text-sm font-bold transition-all whitespace-nowrap", activeSubTab === 'summary' ? "bg-accent text-primary shadow-lg" : "text-slate-400 hover:text-white")}
         >
           Insights
         </button>
@@ -1313,7 +1530,7 @@ function AttendanceView({ members, attendance, onRefresh, setLoading, hasScope, 
       {activeSubTab === 'grid' && renderGrid()}
       
       {activeSubTab === 'history' && (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
           {sessions.length === 0 ? (
             <div className="col-span-full py-20 text-center glass rounded-2xl border border-white/5">
               <Calendar className="w-12 h-12 text-slate-600 mx-auto mb-4" />
@@ -1351,20 +1568,20 @@ function AttendanceView({ members, attendance, onRefresh, setLoading, hasScope, 
           <Card title="Attendance Analysis" icon={Zap}>
             <div className="flex items-center justify-between mb-4">
               <p className="text-sm text-slate-400">Leverage AI to identify trends, missing members, and engagement levels.</p>
-              <Button onClick={() => updateInsights()}>
+              <Button onClick={() => updateInsights()} disabled={isAiLoading}>
                 <Zap className="w-4 h-4" /> {insights ? "Refresh Analysis" : "Generate Analysis"}
               </Button>
             </div>
-            {insights && (
+            {(isAiLoading || insights) && (
               <div className="p-6 bg-white/5 rounded-2xl border border-white/10 prose prose-invert max-w-none">
-                <Markdown>{insights}</Markdown>
+                {isAiLoading && !insights ? <ThinkingIndicator /> : <Markdown>{insights}</Markdown>}
               </div>
             )}
           </Card>
 
           <Card className="p-0 overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="w-full text-left">
+          <div className="overflow-x-auto custom-scrollbar">
+            <table className="w-full text-left text-sm">
               <thead>
                 <tr className="bg-white/5 border-b border-white/10">
                   <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase">Member</th>
@@ -1516,12 +1733,15 @@ function TasksView({ tasks, teams, members, onRefresh, currentUser, hasScope }: 
     { id: 'done', label: 'Done', color: 'bg-emerald-400' }
   ];
 
+  // Get dynamic colors for charts
+  const secondaryColor = getCSSVariable('--color-secondary') || '#1e293b';
+
   return (
-    <div className="space-y-6">
-      <div className="flex flex-col md:flex-row gap-4 items-center justify-between">
-        <div className="flex items-center gap-3">
+    <div className="space-y-4 sm:space-y-6">
+      <div className="flex flex-col gap-3 sm:flex-row sm:gap-4 sm:items-center sm:justify-between">
+        <div className="flex flex-col sm:flex-row gap-2 sm:gap-3 w-full sm:w-auto">
           <Select 
-            className="w-48"
+            className="w-full sm:w-48"
             options={[
               { label: 'All Teams', value: 'all' },
               ...teams.map(t => ({ label: `${t.name} #${t.number}`, value: t.id.toString() }))
@@ -1529,16 +1749,16 @@ function TasksView({ tasks, teams, members, onRefresh, currentUser, hasScope }: 
             value={filterTeam} 
             onChange={(e: any) => setFilterTeam(e.target.value)}
           />
-          <Button variant="secondary" onClick={() => setShowAnalytics(!showAnalytics)}>
+          <Button variant="secondary" onClick={() => setShowAnalytics(!showAnalytics)} className="w-full sm:w-auto">
             <TrendingUp className="w-4 h-4 mr-2" />
             {showAnalytics ? "Board View" : "Analytics"}
           </Button>
         </div>
-        <Button onClick={() => setShowAddTask(true)}><Plus className="w-4 h-4" /> New Task</Button>
+        <Button onClick={() => setShowAddTask(true)} className="w-full sm:w-auto"><Plus className="w-4 h-4" /> New Task</Button>
       </div>
 
       {showAnalytics ? (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6">
           <Card title="Completion Trend (Last 7 Days)" icon={TrendingUp}>
             <div className="h-64 min-h-[250px] w-full mt-4">
               <ResponsiveContainer width="100%" height="100%">
@@ -1564,7 +1784,7 @@ function TasksView({ tasks, teams, members, onRefresh, currentUser, hasScope }: 
                   <XAxis type="number" stroke="#94a3b8" fontSize={12} />
                   <YAxis dataKey="name" type="category" stroke="#94a3b8" fontSize={10} width={80} />
                   <Tooltip 
-                    contentStyle={{ backgroundColor: '#1e293b', border: 'none', borderRadius: '8px', color: '#fff' }}
+                    contentStyle={{ backgroundColor: secondaryColor, border: 'none', borderRadius: '8px', color: '#fff' }}
                   />
                   <Bar dataKey="todo" stackId="a" fill="#64748b" />
                   <Bar dataKey="inProgress" stackId="a" fill="#60a5fa" />
@@ -1594,7 +1814,7 @@ function TasksView({ tasks, teams, members, onRefresh, currentUser, hasScope }: 
           </Card>
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 h-[calc(100vh-250px)]">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 sm:gap-4 h-auto min-h-[600px] md:h-[calc(100vh-250px)]">
         {columns.map(col => (
           <div key={col.id} className="bg-secondary/30 rounded-2xl p-4 flex flex-col gap-4 border border-white/5">
             <div className="flex items-center gap-2 mb-2">
@@ -1715,8 +1935,8 @@ function BudgetView({ budget, teams, onRefresh, hasScope }: any) {
   const isAdmin = hasScope('budget');
 
   return (
-    <div className="space-y-6">
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+    <div className="space-y-4 sm:space-y-6">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 sm:gap-6">
         <Card className="bg-emerald-500/10 border-emerald-500/20">
           <p className="text-xs text-emerald-400 uppercase font-bold">Total Income</p>
           <p className="text-3xl font-display font-bold text-white">${totalIncome.toLocaleString()}</p>
@@ -1731,13 +1951,13 @@ function BudgetView({ budget, teams, onRefresh, hasScope }: any) {
         </Card>
       </div>
 
-      <div className="flex items-center justify-between">
-        <h3 className="text-xl font-display font-bold text-white">Transaction History</h3>
-        {isAdmin && <Button onClick={() => setShowAdd(true)}><Plus className="w-4 h-4" /> Log Transaction</Button>}
+      <div className="flex flex-col sm:flex-row gap-3 sm:gap-0 sm:items-center sm:justify-between">
+        <h3 className="text-lg sm:text-xl font-display font-bold text-white">Transaction History</h3>
+        {isAdmin && <Button onClick={() => setShowAdd(true)} className="w-full sm:w-auto"><Plus className="w-4 h-4" /> Log Transaction</Button>}
       </div>
 
-      <div className="glass rounded-2xl overflow-hidden">
-        <table className="w-full text-left">
+      <div className="glass rounded-2xl overflow-x-auto custom-scrollbar">
+        <table className="w-full text-left text-sm">
           <thead className="bg-white/5 border-b border-white/10">
             <tr>
               <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase">Date</th>
@@ -1833,13 +2053,13 @@ function OutreachView({ outreach, onRefresh }: any) {
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h3 className="text-xl font-display font-bold text-white">Outreach Log</h3>
-        <Button onClick={() => setShowAdd(true)}><Plus className="w-4 h-4" /> Log Event</Button>
+    <div className="space-y-4 sm:space-y-6">
+      <div className="flex flex-col sm:flex-row gap-3 sm:gap-0 sm:items-center sm:justify-between">
+        <h3 className="text-lg sm:text-xl font-display font-bold text-white">Outreach Log</h3>
+        <Button onClick={() => setShowAdd(true)} className="w-full sm:w-auto"><Plus className="w-4 h-4" /> Log Event</Button>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
         {(outreach || []).map((event: any) => (
           <Card key={event.id} title={event.title} icon={Globe}>
             <div className="flex justify-between items-start">
@@ -1885,22 +2105,26 @@ function OutreachView({ outreach, onRefresh }: any) {
   );
 }
 
-function ScoutView({ news, refreshNews }: any) {
+function ScoutView({ news, refreshNews, isAiLoading, ThinkingIndicator }: any) {
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h3 className="text-xl font-display font-bold text-white">AI Scout: FTC & REV News</h3>
-        <Button onClick={refreshNews} variant="outline"><Clock className="w-4 h-4" /> Refresh News</Button>
+    <div className="space-y-4 sm:space-y-6">
+      <div className="flex flex-col sm:flex-row gap-3 sm:gap-0 sm:items-center sm:justify-between">
+        <h3 className="text-lg sm:text-xl font-display font-bold text-white">AI Scout: FTC & REV News</h3>
+        <Button onClick={refreshNews} variant="outline" disabled={isAiLoading} className="w-full sm:w-auto"><Clock className="w-4 h-4 mr-1" /> Refresh News</Button>
       </div>
 
       <Card className="min-h-[500px]">
         <div className="prose prose-invert max-w-none">
-          {news ? (
+          {isAiLoading && !news ? (
+            <div className="flex flex-col items-center justify-center h-64 gap-4">
+              <ThinkingIndicator />
+              <p className="text-slate-400">Scouring the web for FTC updates...</p>
+            </div>
+          ) : news ? (
             <Markdown>{news}</Markdown>
           ) : (
             <div className="flex flex-col items-center justify-center h-64 gap-4">
-              <div className="w-12 h-12 border-4 border-accent border-t-transparent rounded-full animate-spin" />
-              <p className="text-slate-400">Scouring the web for FTC updates...</p>
+              <p className="text-slate-400">No news available. Click refresh to scout for updates.</p>
             </div>
           )}
         </div>
@@ -1930,13 +2154,13 @@ function CommunicationView({ communications, onRefresh }: any) {
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h3 className="text-xl font-display font-bold text-white">Communication Log</h3>
-        <Button onClick={() => setShowAdd(true)}><Plus className="w-4 h-4" /> Log New Message</Button>
+    <div className="space-y-4 sm:space-y-6">
+      <div className="flex flex-col sm:flex-row gap-3 sm:gap-0 sm:items-center sm:justify-between">
+        <h3 className="text-lg sm:text-xl font-display font-bold text-white">Communication Log</h3>
+        <Button onClick={() => setShowAdd(true)} className="w-full sm:w-auto"><Plus className="w-4 h-4" /> Log New Message</Button>
       </div>
 
-      <div className="space-y-4">
+      <div className="space-y-3 sm:space-y-4">
         {communications.map((comm: any) => (
           <Card key={comm.id} className="relative overflow-hidden">
             <div className={cn(
@@ -2004,7 +2228,9 @@ function ChatView({ messages, members, currentUser, socket }: any) {
   const [content, setContent] = useState('');
   const [mentionSearch, setMentionSearch] = useState('');
   const [showMentions, setShowMentions] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const scrollRef = React.useRef<HTMLDivElement>(null);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -2034,6 +2260,45 @@ function ChatView({ messages, members, currentUser, socket }: any) {
       content: finalContent
     }));
     setContent('');
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !socket) return;
+
+    setUploading(true);
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('sender_id', currentUser.id.toString());
+    formData.append('sender_name', currentUser.name);
+    formData.append('content', content);
+
+    try {
+      const response = await fetch('/api/messages/upload', {
+        method: 'POST',
+        body: formData
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        setContent('');
+        if (fileInputRef.current) fileInputRef.current.value = '';
+      }
+    } catch (error) {
+      console.error('Upload error:', error);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleDeleteMessage = async (msgId: number) => {
+    try {
+      await fetch(`/api/messages/${msgId}`, {
+        method: 'DELETE'
+      });
+    } catch (error) {
+      console.error('Delete error:', error);
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -2066,32 +2331,76 @@ function ChatView({ messages, members, currentUser, socket }: any) {
 
   const filteredMentions = members.filter((m: any) => m.name.toLowerCase().includes(mentionSearch.toLowerCase()));
 
+  const isImageFile = (filepath: string) => {
+    return /\.(jpg|jpeg|png|gif|webp)$/i.test(filepath);
+  };
+
   return (
-    <div className="flex flex-col h-[calc(100vh-180px)] glass rounded-2xl overflow-hidden">
-      <div ref={scrollRef} className="flex-1 p-6 overflow-y-auto space-y-4 custom-scrollbar">
+    <div className="flex flex-col h-[calc(100vh-200px)] sm:h-[calc(100vh-180px)] glass rounded-2xl overflow-hidden">
+      <div ref={scrollRef} className="flex-1 p-4 sm:p-6 overflow-y-auto space-y-3 sm:space-y-4 custom-scrollbar">
         {messages.map((msg: any) => (
-          <div key={msg.id} className={cn("flex flex-col", msg.sender_id === currentUser.id ? "items-end" : "items-start")}>
+          <div key={msg.id} className={cn("flex flex-col group", msg.sender_id === currentUser.id ? "items-end" : "items-start")}>
             <div className="flex items-center gap-2 mb-1">
               <span className="text-[10px] font-bold text-slate-500">{msg.sender_name || members.find((m: any) => m.id === msg.sender_id)?.name}</span>
               <span className="text-[10px] text-slate-600">{format(new Date(msg.timestamp), 'HH:mm')}</span>
+              {msg.sender_id === currentUser.id && !msg.deleted_at && (
+                <button
+                  onClick={() => handleDeleteMessage(msg.id)}
+                  className="text-[10px] text-slate-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
+                  title="Delete message"
+                >
+                  <Trash2 className="w-3 h-3" />
+                </button>
+              )}
             </div>
-            <div className={cn(
-              "px-4 py-2 rounded-2xl max-w-[80%] text-sm",
-              msg.sender_id === currentUser.id ? "bg-accent text-primary font-medium" : "bg-white/5 text-white border border-white/5"
-            )}>
-              {msg.content.split(/(@\[[^\]]+\])/).map((part: string, i: number) => {
-                if (part.startsWith('@[') && part.endsWith(']')) {
-                  const name = part.slice(2, -1);
-                  return <span key={i} className="font-bold underline decoration-accent decoration-2 underline-offset-2">@{name}</span>;
-                }
-                return part;
-              })}
-            </div>
+            {msg.deleted_at ? (
+              <div className={cn(
+                "px-4 py-2 rounded-2xl max-w-[80%] text-sm italic",
+                "bg-white/5 text-slate-400 border border-white/5"
+              )}>
+                {msg.sender_name || members.find((m: any) => m.id === msg.sender_id)?.name} unsent a message
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2 max-w-[80%]">
+                {msg.file_path && isImageFile(msg.file_path) && (
+                  <img 
+                    src={msg.file_path} 
+                    alt="uploaded" 
+                    className="rounded-lg max-w-xs max-h-64 object-cover"
+                  />
+                )}
+                {msg.file_path && !isImageFile(msg.file_path) && (
+                  <a 
+                    href={msg.file_path}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-2 px-4 py-2 rounded-2xl bg-accent/20 border border-accent/30 hover:bg-accent/30 transition-colors text-sm text-accent"
+                  >
+                    <FileText className="w-4 h-4" />
+                    Download
+                  </a>
+                )}
+                {msg.content && (
+                  <div className={cn(
+                    "px-4 py-2 rounded-2xl text-sm",
+                    msg.sender_id === currentUser.id ? "bg-accent text-primary font-medium" : "bg-white/5 text-white border border-white/5"
+                  )}>
+                    {msg.content.split(/(@\[[^\]]+\])/).map((part: string, i: number) => {
+                      if (part.startsWith('@[') && part.endsWith(']')) {
+                        const name = part.slice(2, -1);
+                        return <span key={i} className="font-bold underline decoration-accent decoration-2 underline-offset-2">@{name}</span>;
+                      }
+                      return part;
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         ))}
       </div>
       
-      <div className="p-4 border-t border-white/5 bg-secondary/30 relative">
+      <div className="p-3 sm:p-4 border-t border-white/5 bg-secondary/30 relative">
         {showMentions && filteredMentions.length > 0 && (
           <div className="absolute bottom-full left-4 mb-2 glass rounded-xl border border-white/10 overflow-hidden w-48 shadow-2xl">
             {filteredMentions.slice(0, 5).map((m: any) => (
@@ -2111,23 +2420,63 @@ function ChatView({ messages, members, currentUser, socket }: any) {
           </div>
         )}
         <div className="flex gap-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            onChange={handleFileUpload}
+            className="hidden"
+            disabled={uploading}
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploading}
+            className="h-10 sm:h-12 w-10 sm:w-12 p-0 rounded-xl transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50 bg-slate-800 text-white hover:bg-slate-700 flex-shrink-0"
+            title="Attach file"
+          >
+            <FileUp className="w-4 sm:w-5 h-4 sm:h-5" />
+          </button>
           <textarea 
-            className="flex-1 bg-primary border border-white/10 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-accent/50 transition-colors h-12 resize-none"
+            className="flex-1 bg-primary border border-white/10 rounded-xl px-3 sm:px-4 py-2 text-sm text-white focus:outline-none focus:border-accent/50 transition-colors h-10 sm:h-12 resize-none"
             placeholder="Type a message... use @ to mention"
             value={content}
             onChange={onContentChange}
             onKeyDown={handleKeyDown}
+            disabled={uploading}
           />
-          <Button onClick={handleSend} className="h-12 w-12 p-0"><Send className="w-5 h-5" /></Button>
+          <Button onClick={handleSend} disabled={uploading} className="h-10 sm:h-12 w-10 sm:w-12 p-0 flex-shrink-0"><Send className="w-4 sm:w-5 h-4 sm:h-5" /></Button>
         </div>
       </div>
     </div>
   );
 }
 
-function ProfileView({ currentUser, onRefresh, setLoading, hasScope }: any) {
+function ProfileView({ currentUser, onRefresh, setLoading, hasScope, setColorVersion }: any) {
   const [name, setName] = useState(currentUser?.name || '');
   const [role, setRole] = useState(currentUser?.role || '');
+  const [accentColor, setAccentColor] = useState(currentUser?.accent_color || '');
+  const [primaryColor, setPrimaryColor] = useState(currentUser?.primary_color || '');
+  const [textColor, setTextColor] = useState(currentUser?.text_color || '');
+
+  useEffect(() => {
+    if (currentUser) {
+      setName(currentUser.name || '');
+      setRole(currentUser.role || '');
+      setAccentColor(currentUser.accent_color || '');
+      setPrimaryColor(currentUser.primary_color || '');
+      setTextColor(currentUser.text_color || '');
+    }
+  }, [currentUser]);
+
+  // Apply color changes in real-time to the page
+  useEffect(() => {
+    const root = document.documentElement;
+    if (accentColor) root.style.setProperty('--color-accent', accentColor);
+    if (primaryColor) root.style.setProperty('--color-primary', primaryColor);
+    if (textColor) root.style.setProperty('--color-text-base', textColor);
+    
+    // Trigger re-render of all components to pick up new CSS variables
+    setColorVersion((v) => v + 1);
+  }, [accentColor, primaryColor, textColor, setColorVersion]);
 
   const handleSave = async () => {
     setLoading(true);
@@ -2147,10 +2496,20 @@ function ProfileView({ currentUser, onRefresh, setLoading, hasScope }: any) {
       const res = await fetch(`/api/members/${currentUser.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...currentUser, name, role, scopes: currentScopes })
+        body: JSON.stringify({ 
+          team_id: currentUser.team_id,
+          name: name, 
+          role: role, 
+          email: currentUser.email,
+          is_board: currentUser.is_board,
+          scopes: currentScopes,
+          accent_color: accentColor || undefined,
+          primary_color: primaryColor || undefined,
+          text_color: textColor || undefined
+        })
       });
       if (res.ok) {
-        onRefresh();
+        await onRefresh();
         alert('Profile updated successfully!');
       }
     } finally {
@@ -2158,22 +2517,10 @@ function ProfileView({ currentUser, onRefresh, setLoading, hasScope }: any) {
     }
   };
 
-  const handleFullPower = async () => {
-    setLoading(true);
-    try {
-      const allScopes = ['attendance', 'budget', 'tasks', 'admin'];
-      const res = await fetch(`/api/members/${currentUser.id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...currentUser, scopes: allScopes })
-      });
-      if (res.ok) {
-        onRefresh();
-        alert('All scopes granted! You have full power.');
-      }
-    } finally {
-      setLoading(false);
-    }
+  const resetColors = () => {
+    setAccentColor('');
+    setPrimaryColor('');
+    setTextColor('');
   };
 
   const isAdmin = hasScope('admin');
@@ -2191,13 +2538,34 @@ function ProfileView({ currentUser, onRefresh, setLoading, hasScope }: any) {
             <label className="text-xs font-bold text-slate-400 uppercase">Role / Description</label>
             <Input value={role} onChange={(e: any) => setRole(e.target.value)} />
           </div>
-          <div className="pt-2 flex gap-3">
+          
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-2">
+            <div className="space-y-1">
+              <label className="text-xs font-bold text-slate-400 uppercase">Accent (Yellow)</label>
+              <div className="flex gap-2">
+                <input type="color" className="w-10 h-10 rounded-lg bg-transparent border-none cursor-pointer" value={accentColor || '#fbbf24'} onChange={(e) => setAccentColor(e.target.value)} />
+                <Input value={accentColor} onChange={(e: any) => setAccentColor(e.target.value)} placeholder="#fbbf24" />
+              </div>
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-bold text-slate-400 uppercase">Interface (Navy)</label>
+              <div className="flex gap-2">
+                <input type="color" className="w-10 h-10 rounded-lg bg-transparent border-none cursor-pointer" value={primaryColor || '#0f172a'} onChange={(e) => setPrimaryColor(e.target.value)} />
+                <Input value={primaryColor} onChange={(e: any) => setPrimaryColor(e.target.value)} placeholder="#0f172a" />
+              </div>
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-bold text-slate-400 uppercase">Text Color</label>
+              <div className="flex gap-2">
+                <input type="color" className="w-10 h-10 rounded-lg bg-transparent border-none cursor-pointer" value={textColor || '#f1f5f9'} onChange={(e) => setTextColor(e.target.value)} />
+                <Input value={textColor} onChange={(e: any) => setTextColor(e.target.value)} placeholder="#f1f5f9" />
+              </div>
+            </div>
+          </div>
+
+          <div className="pt-2 flex flex-wrap gap-3">
             <Button onClick={handleSave}>Save Changes</Button>
-            {isAdmin && (
-              <Button variant="outline" onClick={handleFullPower} className="border-accent text-accent hover:bg-accent/10">
-                <Zap className="w-4 h-4" /> Full Admin Power
-              </Button>
-            )}
+            <Button variant="secondary" onClick={resetColors}>Reset to Team Default</Button>
           </div>
         </div>
       </Card>
@@ -2229,16 +2597,30 @@ function ProfileView({ currentUser, onRefresh, setLoading, hasScope }: any) {
 
 function SettingsView({ settings, members, onRefresh, currentUser }: any) {
   const [criteria, setCriteria] = useState(settings.excuse_criteria || '');
+  const [maxTokensNews, setMaxTokensNews] = useState(settings.max_tokens_news || '1024');
+  const [maxTokensAttendance, setMaxTokensAttendance] = useState(settings.max_tokens_attendance || '1024');
+  const [maxTokensExcuse, setMaxTokensExcuse] = useState(settings.max_tokens_excuse || '512');
+  const [maxTokensSummary, setMaxTokensSummary] = useState(settings.max_tokens_summary || '1024');
   const [showMemberEdit, setShowMemberEdit] = useState<any>(null);
 
   const isPresident = currentUser?.role === 'President';
 
   const handleSave = async () => {
-    await fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ key: 'excuse_criteria', value: criteria })
-    });
+    const payloads = [
+      { key: 'excuse_criteria', value: criteria },
+      { key: 'max_tokens_news', value: maxTokensNews },
+      { key: 'max_tokens_attendance', value: maxTokensAttendance },
+      { key: 'max_tokens_excuse', value: maxTokensExcuse },
+      { key: 'max_tokens_summary', value: maxTokensSummary },
+    ];
+
+    for (const payload of payloads) {
+      await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+    }
     onRefresh();
     alert('Settings saved');
   };
@@ -2264,7 +2646,31 @@ function SettingsView({ settings, members, onRefresh, currentUser }: any) {
             value={criteria}
             onChange={(e) => setCriteria(e.target.value)}
           />
-          <Button onClick={handleSave}>Save Criteria</Button>
+          <Button onClick={handleSave}>Save Settings</Button>
+        </div>
+      </Card>
+
+      <Card title="AI Configuration (Max Tokens)" icon={Bolt}>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="space-y-1">
+            <label className="text-xs font-bold text-slate-400 uppercase">News Scout</label>
+            <Input type="number" value={maxTokensNews} onChange={(e: any) => setMaxTokensNews(e.target.value)} />
+          </div>
+          <div className="space-y-1">
+            <label className="text-xs font-bold text-slate-400 uppercase">Attendance Analysis</label>
+            <Input type="number" value={maxTokensAttendance} onChange={(e: any) => setMaxTokensAttendance(e.target.value)} />
+          </div>
+          <div className="space-y-1">
+            <label className="text-xs font-bold text-slate-400 uppercase">Excuse Checker</label>
+            <Input type="number" value={maxTokensExcuse} onChange={(e: any) => setMaxTokensExcuse(e.target.value)} />
+          </div>
+          <div className="space-y-1">
+            <label className="text-xs font-bold text-slate-400 uppercase">Activity Summary</label>
+            <Input type="number" value={maxTokensSummary} onChange={(e: any) => setMaxTokensSummary(e.target.value)} />
+          </div>
+        </div>
+        <div className="mt-4">
+          <Button onClick={handleSave}>Save AI Limits</Button>
         </div>
       </Card>
 
