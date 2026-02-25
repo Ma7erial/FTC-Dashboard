@@ -34,7 +34,8 @@ import {
   FileUp,
   FileText,
   Bolt,
-  Code2
+  Code2,
+  Check
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
@@ -1389,30 +1390,57 @@ function AttendanceView({ members, attendance, onRefresh, setLoading, hasScope, 
   const [activeSubTab, setActiveSubTab] = useState<'grid' | 'history' | 'summary'>('grid');
   const [sessions, setSessions] = useState<string[]>([]);
   const [summary, setSummary] = useState<any[]>([]);
+  const [hiddenDates, setHiddenDates] = useState<string[]>([]);
+  const [calendarStart, setCalendarStart] = useState(0); // weeks from today
+  const [showHideMenu, setShowHideMenu] = useState(false);
+  const [savingStatus, setSavingStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const [pendingChanges, setPendingChanges] = useState<Map<number, { date: string; status: string }>>(new Map());
 
   const isAdmin = hasScope('attendance');
 
   useEffect(() => {
     const fetchExtraData = async () => {
-      const [sess, summ] = await Promise.all([
+      const [sess, summ, hidden] = await Promise.all([
         fetch('/api/attendance/sessions').then(r => r.json()),
-        fetch('/api/attendance/summary').then(r => r.json())
+        fetch('/api/attendance/summary').then(r => r.json()),
+        fetch('/api/hidden-dates').then(r => r.json())
       ]);
       if (Array.isArray(sess)) setSessions(sess);
       if (Array.isArray(summ)) setSummary(summ);
+      if (Array.isArray(hidden)) setHiddenDates(hidden);
     };
     fetchExtraData();
   }, [attendance]);
 
-  const last14Days = useMemo(() => {
-    return Array.from({ length: 14 }, (_, i) => {
-      const d = new Date();
-      d.setDate(d.getDate() - (13 - i));
-      return format(d, 'yyyy-MM-dd');
-    });
-  }, []);
+  // Generate dates: 2-week chunks starting from today
+  const visibleDates = useMemo(() => {
+    const dates: string[] = [];
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() + calendarStart * 14);
+    
+    for (let i = 0; i < 14; i++) {
+      const d = new Date(startDate);
+      d.setDate(d.getDate() + i);
+      const dateStr = format(d, 'yyyy-MM-dd');
+      if (!hiddenDates.includes(dateStr)) {
+        dates.push(dateStr);
+      }
+    }
+    return dates;
+  }, [calendarStart, hiddenDates]);
+
+  // Check if there are more dates to load
+  const hasMoreDates = useMemo(() => {
+    const nextStartDate = new Date();
+    nextStartDate.setDate(nextStartDate.getDate() + (calendarStart + 1) * 14);
+    return nextStartDate < new Date(new Date().getFullYear() + 1, 0, 1); // Can load up to next year
+  }, [calendarStart]);
 
   const getStatus = (memberId: number, date: string) => {
+    const changeKey = memberId;
+    if (pendingChanges.has(changeKey) && pendingChanges.get(changeKey)!.date === date) {
+      return pendingChanges.get(changeKey)!.status;
+    }
     return attendance.find((r: any) => r.member_id === memberId && r.date === date)?.status || '-';
   };
 
@@ -1424,7 +1452,13 @@ function AttendanceView({ members, attendance, onRefresh, setLoading, hasScope, 
     const nextIndex = (statuses.indexOf(current) + 1) % statuses.length;
     const nextStatus = statuses[nextIndex];
 
-    setLoading(true);
+    // Optimistic update
+    const changeKey = memberId;
+    const newChanges = new Map(pendingChanges);
+    newChanges.set(changeKey, { date, status: nextStatus });
+    setPendingChanges(newChanges);
+    setSavingStatus('saving');
+
     try {
       const res = await fetch('/api/attendance/batch', {
         method: 'POST',
@@ -1435,10 +1469,114 @@ function AttendanceView({ members, attendance, onRefresh, setLoading, hasScope, 
         })
       });
       if (res.ok) {
+        setSavingStatus('saved');
+        setTimeout(() => setSavingStatus('idle'), 2000);
+        // Keep optimistic update, refresh data in background
         onRefresh();
+      } else {
+        setSavingStatus('idle');
+        alert('Failed to save attendance');
       }
-    } finally {
-      setLoading(false);
+    } catch (error) {
+      setSavingStatus('idle');
+      alert('Error saving attendance');
+    }
+  };
+
+  const hideDate = async (dateStr: string) => {
+    setHiddenDates([...hiddenDates, dateStr]);
+    try {
+      await fetch('/api/hidden-dates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ date: dateStr })
+      });
+    } catch (error) {
+      console.error('Error hiding date:', error);
+      setHiddenDates(hiddenDates.filter(d => d !== dateStr));
+    }
+  };
+
+  const unhideDate = async (dateStr: string) => {
+    setHiddenDates(hiddenDates.filter(d => d !== dateStr));
+    try {
+      await fetch(`/api/hidden-dates/${dateStr}`, { method: 'DELETE' });
+    } catch (error) {
+      console.error('Error unhiding date:', error);
+      setHiddenDates([...hiddenDates, dateStr]);
+    }
+  };
+
+  const hideByDayOfWeek = async (dayIndex: number) => {
+    // dayIndex: 0=Sunday, 1=Monday, ..., 6=Saturday
+    const newHidden = [...hiddenDates];
+    const checkDate = new Date();
+    checkDate.setDate(checkDate.getDate() - 365); // Check past year too for cleanup
+    
+    for (let i = 0; i < 730; i++) { // Check ~2 years
+      checkDate.setDate(checkDate.getDate() + 1);
+      if (checkDate.getDay() === dayIndex) {
+        const dateStr = format(checkDate, 'yyyy-MM-dd');
+        if (!newHidden.includes(dateStr)) {
+          newHidden.push(dateStr);
+        }
+      }
+    }
+    
+    setHiddenDates(newHidden);
+    // Save all hidden dates
+    for (const date of newHidden) {
+      if (!hiddenDates.includes(date)) {
+        await fetch('/api/hidden-dates', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ date })
+        }).catch(console.error);
+      }
+    }
+  };
+
+  const unhideByDayOfWeek = async (dayIndex: number) => {
+    const newHidden = hiddenDates.filter(dateStr => {
+      return new Date(dateStr).getDay() !== dayIndex;
+    });
+    
+    setHiddenDates(newHidden);
+    // Delete all removed dates
+    for (const date of hiddenDates) {
+      if (!newHidden.includes(date)) {
+        await fetch(`/api/hidden-dates/${date}`, { method: 'DELETE' }).catch(console.error);
+      }
+    }
+  };
+
+  const hideAll = async () => {
+    const allDates = new Set<string>();
+    const checkDate = new Date();
+    checkDate.setDate(checkDate.getDate() - 365);
+    
+    for (let i = 0; i < 730; i++) {
+      checkDate.setDate(checkDate.getDate() + 1);
+      allDates.add(format(checkDate, 'yyyy-MM-dd'));
+    }
+    
+    const newHidden = Array.from(allDates);
+    setHiddenDates(newHidden);
+    for (const date of newHidden) {
+      if (!hiddenDates.includes(date)) {
+        await fetch('/api/hidden-dates', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ date })
+        }).catch(console.error);
+      }
+    }
+  };
+
+  const unhideAll = async () => {
+    setHiddenDates([]);
+    for (const date of hiddenDates) {
+      await fetch(`/api/hidden-dates/${date}`, { method: 'DELETE' }).catch(console.error);
     }
   };
 
@@ -1451,50 +1589,165 @@ function AttendanceView({ members, attendance, onRefresh, setLoading, hasScope, 
     '-': 'bg-white/5 text-slate-500'
   };
 
+  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
   const renderGrid = () => (
-    <div className="glass rounded-2xl overflow-x-auto custom-scrollbar">
-      <div className="overflow-x-auto">
-        <table className="w-full text-left text-sm border-collapse">
-          <thead>
-            <tr className="bg-white/5 border-b border-white/10">
-              <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase sticky left-0 bg-[#0f172a] z-10 min-w-[150px]">Member</th>
-              {last14Days.map(date => (
-                <th key={date} className="px-2 py-3 text-[10px] font-bold text-slate-400 uppercase text-center min-w-[40px]">
-                  {format(new Date(date), 'MMM dd')}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-white/5">
-            {members.map((m: any) => (
-              <tr key={m.id} className="hover:bg-white/5 transition-colors">
-                <td className="px-4 py-3 text-sm text-white font-medium sticky left-0 bg-[#0f172a]/90 backdrop-blur-md z-10 border-r border-white/5">
-                  {m.name}
-                </td>
-                {last14Days.map(date => {
-                  const status = getStatus(m.id, date);
-                  return (
-                    <td key={date} className="px-1 py-1 text-center">
-                      <button
-                        onClick={() => toggleStatus(m.id, date)}
-                        disabled={!isAdmin}
-                        className={cn(
-                          "w-8 h-8 rounded-lg flex items-center justify-center text-[10px] font-bold transition-all active:scale-90",
-                          statusColors[status] || statusColors['-'],
-                          !isAdmin && "cursor-default"
-                        )}
-                      >
-                        {status}
-                      </button>
-                    </td>
-                  );
-                })}
-              </tr>
-            ))}
-          </tbody>
-        </table>
+    <div className="space-y-4">
+      <div className="flex flex-col sm:flex-row gap-3 sm:items-center sm:justify-between">
+        <div className="flex gaps-2 sm:gap-3 items-center">
+          <button 
+            onClick={() => setCalendarStart(Math.max(0, calendarStart - 1))}
+            className="px-3 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-sm font-bold text-slate-300"
+            disabled={calendarStart === 0}
+          >
+            ← Previous
+          </button>
+          <span className="text-xs text-slate-400">
+            {format(new Date(new Date().getTime() + calendarStart * 14 * 24 * 60 * 60 * 1000), 'MMM dd')} - {format(new Date(new Date().getTime() + (calendarStart * 14 + 13) * 24 * 60 * 60 * 1000), 'MMM dd')}
+          </span>
+          {hasMoreDates && (
+            <button 
+              onClick={() => setCalendarStart(calendarStart + 1)}
+              className="px-3 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-sm font-bold text-slate-300"
+            >
+              Next →
+            </button>
+          )}
+        </div>
+        
+        <div className="flex gap-2 items-center">
+          {savingStatus !== 'idle' && (
+            <div className="flex items-center gap-1 text-xs px-3 py-1 rounded-lg bg-white/5">
+              {savingStatus === 'saving' && <Clock className="w-3 h-3 text-amber-400 animate-spin" />}
+              {savingStatus === 'saved' && <Check className="w-3 h-3 text-emerald-400" />}
+              <span className="text-slate-300">{savingStatus === 'saving' ? 'Saving...' : 'Saved'}</span>
+            </div>
+          )}
+          <button 
+            onClick={() => setShowHideMenu(!showHideMenu)}
+            className="px-3 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-sm font-bold text-slate-300 flex items-center gap-2"
+            title="Show/hide dates"
+          >
+            {showHideMenu ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+            <span className="hidden sm:inline">Manage Dates</span>
+          </button>
+        </div>
       </div>
-      <div className="p-4 bg-white/5 border-t border-white/10 flex flex-wrap gap-4 text-[10px] font-bold uppercase">
+
+      {showHideMenu && (
+        <div className="glass rounded-2xl p-4 border border-white/10 space-y-4">
+          <h4 className="text-sm font-bold text-white">Hide/Show Meeting Dates</h4>
+          
+          <div className="space-y-3">
+            <div>
+              <p className="text-xs text-slate-400 font-bold mb-2">By Day of Week</p>
+              <div className="grid grid-cols-4 sm:grid-cols-7 gap-2">
+                {dayNames.map((name, idx) => (
+                  <button
+                    key={idx}
+                    onClick={() => {
+                      const isHidden = hiddenDates.some(d => new Date(d).getDay() === idx);
+                      if (isHidden) {
+                        unhideByDayOfWeek(idx);
+                      } else {
+                        hideByDayOfWeek(idx);
+                      }
+                    }}
+                    className={cn(
+                      "py-2 rounded-lg text-[10px] font-bold uppercase transition-all",
+                      hiddenDates.some(d => new Date(d).getDay() === idx)
+                        ? "bg-rose-500/20 text-rose-400 border border-rose-500/30"
+                        : "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
+                    )}
+                  >
+                    {name}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex gap-2 pt-2">
+              <Button 
+                variant="secondary" 
+                size="sm"
+                onClick={hideAll}
+                className="text-xs"
+              >
+                Hide All
+              </Button>
+              <Button 
+                variant="secondary" 
+                size="sm"
+                onClick={unhideAll}
+                className="text-xs"
+              >
+                Show All
+              </Button>
+            </div>
+
+            <div className="text-[10px] text-slate-500">
+              {hiddenDates.length} dates hidden • Showing {visibleDates.length} dates
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="glass rounded-2xl overflow-x-auto custom-scrollbar">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm border-collapse">
+            <thead>
+              <tr className="bg-white/5 border-b border-white/10">
+                <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase sticky left-0 bg-[#0f172a] z-10 min-w-[150px]">Member</th>
+                {visibleDates.map(date => (
+                  <th key={date} className="px-2 py-3 text-[10px] font-bold text-slate-400 uppercase text-center min-w-[40px] group relative">
+                    <div className="text-center">
+                      {format(new Date(date), 'MMM dd')}
+                      <div className="text-[8px] text-slate-600">{format(new Date(date), 'EEE')}</div>
+                    </div>
+                    {isAdmin && (
+                      <button
+                        onClick={() => hideDate(date)}
+                        className="absolute -top-6 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity text-[10px] bg-rose-500/20 text-rose-400 px-2 py-1 rounded whitespace-nowrap"
+                        title="Hide this date"
+                      >
+                        Hide
+                      </button>
+                    )}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-white/5">
+              {members.map((m: any) => (
+                <tr key={m.id} className="hover:bg-white/5 transition-colors">
+                  <td className="px-4 py-3 text-sm text-white font-medium sticky left-0 bg-[#0f172a]/90 backdrop-blur-md z-10 border-r border-white/5">
+                    {m.name}
+                  </td>
+                  {visibleDates.map(date => {
+                    const status = getStatus(m.id, date);
+                    return (
+                      <td key={date} className="px-1 py-1 text-center">
+                        <button
+                          onClick={() => toggleStatus(m.id, date)}
+                          disabled={!isAdmin}
+                          className={cn(
+                            "w-8 h-8 rounded-lg flex items-center justify-center text-[10px] font-bold transition-all active:scale-90",
+                            statusColors[status] || statusColors['-'],
+                            !isAdmin && "cursor-default"
+                          )}
+                        >
+                          {status}
+                        </button>
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div className="p-4 bg-white/5 border-t border-white/10 flex flex-wrap gap-4 text-[10px] font-bold uppercase rounded-b-2xl">
         <div className="flex items-center gap-2"><div className="w-3 h-3 rounded bg-emerald-500" /> Present (P)</div>
         <div className="flex items-center gap-2"><div className="w-3 h-3 rounded bg-amber-500" /> Late (L)</div>
         <div className="flex items-center gap-2"><div className="w-3 h-3 rounded bg-blue-500" /> Excused (E)</div>

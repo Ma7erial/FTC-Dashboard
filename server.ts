@@ -143,7 +143,29 @@ async function callOllama(prompt: string, stream: boolean, onChunk?: (chunk: str
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const db = new Database("nexus.db");
+let db = new Database("nexus.db");
+
+// Function to ensure database connection is valid and writable
+function ensureDbConnection() {
+  try {
+    // Test if database is writable
+    db.exec("PRAGMA query_only=false");
+    return true;
+  } catch (error: any) {
+    if (error.code === 'SQLITE_READONLY' || error.code === 'SQLITE_READONLY_DBMOVED') {
+      console.log("[Database] Attempting to reconnect to database...");
+      try {
+        db.close();
+      } catch (e) {
+        // Ignore close errors
+      }
+      // Reconnect
+      db = new Database("nexus.db");
+      return true;
+    }
+    throw error;
+  }
+}
 
 // Initialize Database - Create all tables first
 db.exec(`
@@ -591,6 +613,9 @@ async function startServer() {
       }
 
       console.log(`[Attendance] Updating ${records.length} records for ${date}`);
+      
+      // Ensure database connection is valid and writable
+      ensureDbConnection();
 
       const insert = db.prepare(`
         INSERT INTO attendance (member_id, date, status, reason) 
