@@ -33,6 +33,7 @@ import {
   Trash2,
   FileUp,
   FileText,
+  Download,
   Bolt,
   Code2,
   Check
@@ -91,7 +92,8 @@ const Button = ({ children, className, variant = 'primary', ...props }: any) => 
     outline: {
       className: 'text-accent hover:opacity-80 border border-current font-bold',
     },
-    ghost: 'text-slate-400 hover:text-white hover:bg-white/5'
+    ghost: 'text-slate-400 hover:text-white hover:bg-white/5',
+    danger: 'bg-rose-900/30 text-rose-400 hover:bg-rose-900/50 border border-rose-500/30'
   };
   
   const variantConfig = variants[variant as keyof typeof variants];
@@ -157,6 +159,7 @@ export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [budget, setBudget] = useState<BudgetItem[]>([]);
   const [outreach, setOutreach] = useState<OutreachEvent[]>([]);
+  const [inventory, setInventory] = useState<any[]>([]);
   const [communications, setCommunications] = useState<Communication[]>([]);
   const [documentation, setDocumentation] = useState<any[]>([]);
   const [messages, setMessages] = useState<any[]>([]);
@@ -170,6 +173,15 @@ export default function App() {
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [aiLoadingTarget, setAiLoadingTarget] = useState<string | null>(null);
   const [colorVersion, setColorVersion] = useState(0);
+
+  // Session State
+  const [sessionId, setSessionId] = useState<string | null>(() => {
+    if (typeof localStorage !== 'undefined') {
+      return localStorage.getItem('sessionId');
+    }
+    return null;
+  });
+  const [streamSessions, setStreamSessions] = useState<Map<string, { streamId?: string; position: number }>>(new Map());
 
   // --- Components ---
 
@@ -296,9 +308,15 @@ export default function App() {
         if (msg.type === 'chat') {
           setMessages(prev => [...prev, msg]);
         } else if (msg.type === 'message_deleted') {
-          setMessages(prev => 
-            prev.map(m => m.id === msg.id ? { ...m, deleted_at: msg.deleted_at } : m)
-          );
+          if (msg.deleted_permanently) {
+            // Remove message completely for permanent deletion
+            setMessages(prev => prev.filter(m => m.id !== msg.id));
+          } else {
+            // Soft delete - mark as deleted
+            setMessages(prev => 
+              prev.map(m => m.id === msg.id ? { ...m, deleted_at: msg.deleted_at } : m)
+            );
+          }
         } else if (msg.type === 'notification') {
           if (currentUser && msg.notification.user_id === currentUser.id) {
             setNotifications(prev => [msg.notification, ...prev]);
@@ -377,6 +395,7 @@ export default function App() {
         tasks, 
         messages, 
         budget,
+        inventory,
         userScope: { role: currentUser.role, is_board: currentUser.is_board, scopes: currentUser.scopes }
       }, (chunk) => {
         aggSummary += chunk;
@@ -414,13 +433,14 @@ export default function App() {
         }
       };
 
-      const [t, m, a, tk, b, o, c, msgs, s, h, d] = await Promise.all([
+      const [t, m, a, tk, b, o, inv, c, msgs, s, h, d] = await Promise.all([
         fetchJson('/api/teams'),
         fetchJson('/api/members'),
         fetchJson('/api/attendance'),
         fetchJson('/api/tasks'),
         fetchJson('/api/budget'),
         fetchJson('/api/outreach'),
+        fetchJson('/api/inventory'),
         fetchJson('/api/communications'),
         fetchJson('/api/messages'),
         fetchJson('/api/settings'),
@@ -442,6 +462,7 @@ export default function App() {
       if (Array.isArray(tk)) setTasks(tk);
       if (Array.isArray(b)) setBudget(b);
       if (Array.isArray(o)) setOutreach(o);
+      if (Array.isArray(inv)) setInventory(inv);
       if (Array.isArray(c)) setCommunications(c);
       if (Array.isArray(msgs)) setMessages(msgs);
       if (Array.isArray(h)) setHiddenDates(h);
@@ -478,7 +499,7 @@ export default function App() {
         email: loginEmail, 
         role: 'President', 
         is_board: 1, 
-        scopes: ['attendance', 'budget', 'tasks', 'admin']
+        scopes: ['attendance', 'budget', 'tasks', 'inventory', 'code', 'admin']
       };
       const res = await fetch('/api/members', {
         method: 'POST',
@@ -565,8 +586,9 @@ export default function App() {
     { id: 'attendance', label: 'Attendance', icon: CalendarCheck, scope: 'attendance' },
     { id: 'tasks', label: 'Tasks', icon: CheckSquare },
     { id: 'budget', label: 'Budget', icon: Wallet, scope: 'budget' },
+    { id: 'inventory', label: 'Inventory', icon: Zap, scope: 'inventory' },
     { id: 'outreach', label: 'Outreach', icon: Globe },
-    { id: 'code', label: 'Code', icon: Code2 },
+    { id: 'code', label: 'Code', icon: Code2, scope: 'code' },
     { id: 'comm', label: 'Communication', icon: Mail },
     { id: 'chat', label: 'Messaging', icon: MessageSquare },
     { id: 'scout', label: 'AI Scout', icon: Newspaper },
@@ -576,7 +598,7 @@ export default function App() {
 
   const renderContent = () => {
     const viewProps = {
-      teams, members, attendance, tasks, budget, outreach, communications, 
+      teams, members, attendance, tasks, budget, outreach, inventory, communications, 
       messages, settings, hiddenDates, currentUser, onRefresh: fetchData, setLoading,
       insights, news, summary, socket, hasScope,
       isAiLoading, setIsAiLoading, ThinkingIndicator, aiLoadingTarget,
@@ -592,6 +614,7 @@ export default function App() {
       case 'attendance': return <AttendanceView {...viewProps} />;
       case 'tasks': return <TasksView {...viewProps} />;
       case 'budget': return <BudgetView {...viewProps} />;
+      case 'inventory': return <InventoryView {...viewProps} />;
       case 'outreach': return <OutreachView {...viewProps} />;
       case 'code': return <CodeView {...viewProps} />;
       case 'comm': return <CommunicationView {...viewProps} />;
@@ -1353,7 +1376,7 @@ function TeamsView({ teams, members, onRefresh, currentUser, hasScope }: any) {
                 <div className="space-y-2">
                   <p className="text-xs text-slate-400 font-bold uppercase">Scopes</p>
                   <div className="flex flex-wrap gap-2">
-                    {['attendance', 'budget', 'tasks', 'admin'].map(s => (
+                    {['attendance', 'budget', 'tasks', 'inventory', 'code', 'admin'].map(s => (
                       <button 
                         key={s}
                         type="button"
@@ -2285,6 +2308,309 @@ function BudgetView({ budget, teams, onRefresh, hasScope }: any) {
   );
 }
 
+function InventoryView({ inventory, members, teams, onRefresh }: any) {
+  const [showAdd, setShowAdd] = useState(false);
+  const [showEdit, setShowEdit] = useState<any>(null);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [filterCategory, setFilterCategory] = useState('');
+  const [revLink, setRevLink] = useState('');
+  const [isLoadingRev, setIsLoadingRev] = useState(false);
+  const [newPart, setNewPart] = useState({ 
+    team_id: '', name: '', part_number: '', sku: '', quantity: '1', assigned_to: '', 
+    location: '', category: '', description: '', cost: '' 
+  });
+
+  const handleAdd = async () => {
+    if (!newPart.name || !newPart.sku) {
+      alert('Name and SKU are required');
+      return;
+    }
+    try {
+      const res = await fetch('/api/inventory', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...newPart,
+          team_id: newPart.team_id ? parseInt(newPart.team_id) : null,
+          quantity: parseInt(newPart.quantity) || 0,
+          assigned_to: newPart.assigned_to ? parseInt(newPart.assigned_to) : null,
+          cost: parseFloat(newPart.cost) || 0
+        })
+      });
+      if (res.ok) {
+        setShowAdd(false);
+        setNewPart({ team_id: '', name: '', part_number: '', sku: '', quantity: '1', assigned_to: '', location: '', category: '', description: '', cost: '' });
+        onRefresh();
+      } else {
+        const err = await res.json();
+        alert('Error: ' + err.error);
+      }
+    } catch (error) {
+      alert('Error adding part: ' + error);
+    }
+  };
+
+  const handleUpdate = async () => {
+    if (!showEdit) return;
+    try {
+      const res = await fetch(`/api/inventory/${showEdit.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...showEdit,
+          team_id: showEdit.team_id ? parseInt(showEdit.team_id) : null,
+          assigned_to: showEdit.assigned_to ? parseInt(showEdit.assigned_to) : null,
+          cost: parseFloat(showEdit.cost) || 0
+        })
+      });
+      if (res.ok) {
+        setShowEdit(null);
+        onRefresh();
+      } else {
+        const err = await res.json();
+        alert('Error: ' + err.error);
+      }
+    } catch (error) {
+      alert('Error updating part: ' + error);
+    }
+  };
+
+  const handleDelete = async (id: number) => {
+    if (!confirm('Delete this part?')) return;
+    await fetch(`/api/inventory/${id}`, { method: 'DELETE' });
+    onRefresh();
+  };
+
+  const handleImportRev = async () => {
+    if (!revLink.trim()) {
+      alert('Please enter a REV Robotics link');
+      return;
+    }
+    
+    setIsLoadingRev(true);
+    try {
+      const res = await fetch('/api/inventory/scrape-rev', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: revLink })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        setNewPart({
+          ...newPart,
+          name: data.name || newPart.name,
+          sku: data.sku || newPart.sku,
+          part_number: data.part_number || newPart.part_number,
+          cost: data.cost ? data.cost.toString() : newPart.cost,
+          category: data.category || newPart.category
+        });
+        setRevLink('');
+        alert('Product imported! Review and save when ready.');
+      } else {
+        const err = await res.json();
+        alert('Error: ' + err.error);
+      }
+    } catch (error) {
+      alert('Error importing from REV: ' + error);
+    } finally {
+      setIsLoadingRev(false);
+    }
+  };
+
+  const categories = [...new Set(inventory.map((p: any) => p.category).filter((c: any) => c))];
+  const filteredParts = inventory.filter((p: any) => {
+    const matchSearch = p.name.toLowerCase().includes(searchTerm.toLowerCase()) || 
+                        p.sku.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                        p.part_number.toLowerCase().includes(searchTerm.toLowerCase());
+    const matchCategory = !filterCategory || p.category === filterCategory;
+    return matchSearch && matchCategory;
+  });
+
+  const totalValue = inventory.reduce((acc: number, p: any) => acc + (p.cost * p.quantity), 0);
+
+  return (
+    <div className="space-y-4 sm:space-y-6">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
+        <Card className="bg-accent/10 border-accent/20">
+          <p className="text-xs text-accent uppercase font-bold">Total Parts</p>
+          <p className="text-3xl font-display font-bold text-white">{inventory.length}</p>
+        </Card>
+        <Card className="bg-blue-500/10 border-blue-500/20">
+          <p className="text-xs text-blue-400 uppercase font-bold">Inventory Value</p>
+          <p className="text-3xl font-display font-bold text-white">${totalValue.toLocaleString(undefined, {maximumFractionDigits: 2})}</p>
+        </Card>
+      </div>
+
+      <Card title="Parts Management">
+        <div className="space-y-4">
+          <div className="flex flex-col sm:flex-row gap-3">
+            <Input 
+              placeholder="Search by name, SKU, or part number..." 
+              value={searchTerm}
+              onChange={(e: any) => setSearchTerm(e.target.value)}
+              className="flex-1"
+            />
+            <Select 
+              options={[
+                { label: 'All Categories', value: '' },
+                ...categories.map(c => ({ label: c, value: c }))
+              ]}
+              value={filterCategory}
+              onChange={(e: any) => setFilterCategory(e.target.value)}
+              className="sm:w-48"
+            />
+            <Button onClick={() => setShowAdd(true)} className="w-full sm:w-auto"><Plus className="w-4 h-4" /> Add Part</Button>
+          </div>
+
+          <div className="glass rounded-2xl overflow-x-auto custom-scrollbar">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-white/5 border-b border-white/10 sticky top-0">
+                <tr>
+                  <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase">Name</th>
+                  <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase">SKU</th>
+                  <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase">Part #</th>
+                  <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase">Qty</th>
+                  <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase">Category</th>
+                  <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase">Team</th>
+                  <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase">Assigned To</th>
+                  <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase">Cost</th>
+                  <th className="px-4 py-3 text-xs font-bold text-slate-400 uppercase text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/5">
+                {filteredParts.length === 0 ? (
+                  <tr>
+                    <td colSpan={9} className="px-4 py-8 text-center text-slate-500">No parts found</td>
+                  </tr>
+                ) : (
+                  filteredParts.map((part: any) => (
+                    <tr key={part.id} className="hover:bg-white/5 transition-colors">
+                      <td className="px-4 py-3 text-sm text-white font-medium">{part.name}</td>
+                      <td className="px-4 py-3 text-sm text-accent font-mono">{part.sku}</td>
+                      <td className="px-4 py-3 text-sm text-slate-400">{part.part_number || '—'}</td>
+                      <td className="px-4 py-3 text-sm text-white"><span className="bg-white/10 px-2 py-1 rounded">{part.quantity}</span></td>
+                      <td className="px-4 py-3 text-sm text-slate-400">{part.category || '—'}</td>
+                      <td className="px-4 py-3 text-sm text-slate-400">{teams.find((t: any) => t.id === part.team_id)?.name || '—'}</td>
+                      <td className="px-4 py-3 text-sm text-slate-400">{part.assigned_member_name || '—'}</td>
+                      <td className="px-4 py-3 text-sm text-blue-400">${(part.cost * part.quantity).toLocaleString(undefined, {maximumFractionDigits: 2})}</td>
+                      <td className="px-4 py-3 text-right flex gap-2 justify-end">
+                        <button onClick={() => setShowEdit(part)} className="text-slate-600 hover:text-accent transition-colors">
+                          <Edit2 className="w-4 h-4" />
+                        </button>
+                        <button onClick={() => handleDelete(part.id)} className="text-slate-600 hover:text-rose-400 transition-colors">
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </Card>
+
+      {showAdd && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 overflow-y-auto">
+          <Card title="Add New Part" className="w-full max-w-2xl my-8">
+            <div className="space-y-4">
+              <div className="space-y-2 pb-4 border-b border-white/10">
+                <p className="text-xs font-bold text-slate-400 uppercase">Import from REV Robotics</p>
+                <div className="flex gap-2">
+                  <Input 
+                    placeholder="Paste REV Robotics product link (e.g., https://www.revrobotics.com/rev-31-1596/)" 
+                    value={revLink}
+                    onChange={(e: any) => setRevLink(e.target.value)}
+                    className="flex-1"
+                  />
+                  <Button 
+                    onClick={handleImportRev} 
+                    variant="secondary"
+                    disabled={isLoadingRev || !revLink.trim()}
+                  >
+                    {isLoadingRev ? 'Loading...' : 'Import'}
+                  </Button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <Input placeholder="Part Name *" value={newPart.name} onChange={(e: any) => setNewPart({...newPart, name: e.target.value})} />
+                <Input placeholder="SKU (Unique) *" value={newPart.sku} onChange={(e: any) => setNewPart({...newPart, sku: e.target.value})} />
+                <Input placeholder="Part Number" value={newPart.part_number} onChange={(e: any) => setNewPart({...newPart, part_number: e.target.value})} />
+                <Input placeholder="Quantity" type="number" value={newPart.quantity} onChange={(e: any) => setNewPart({...newPart, quantity: e.target.value})} />
+                <Select 
+                  options={[
+                    { label: 'Select Team', value: '' },
+                    ...teams.map((t: any) => ({ label: `${t.name} #${t.number}`, value: t.id }))
+                  ]}
+                  value={newPart.team_id}
+                  onChange={(e: any) => setNewPart({...newPart, team_id: e.target.value})}
+                />
+                <Input placeholder="Location" value={newPart.location} onChange={(e: any) => setNewPart({...newPart, location: e.target.value})} />
+                <Input placeholder="Category" value={newPart.category} onChange={(e: any) => setNewPart({...newPart, category: e.target.value})} />
+                <Input placeholder="Cost per Unit" type="number" step="0.01" value={newPart.cost} onChange={(e: any) => setNewPart({...newPart, cost: e.target.value})} />
+                <Select 
+                  options={[
+                    { label: 'Not Assigned', value: '' },
+                    ...members.map((m: any) => ({ label: m.name, value: m.id }))
+                  ]}
+                  value={newPart.assigned_to}
+                  onChange={(e: any) => setNewPart({...newPart, assigned_to: e.target.value})}
+                />
+              </div>
+              <Input placeholder="Description" value={newPart.description} onChange={(e: any) => setNewPart({...newPart, description: e.target.value})} />
+              <div className="flex gap-3 justify-end">
+                <Button variant="secondary" onClick={() => setShowAdd(false)}>Cancel</Button>
+                <Button onClick={handleAdd}>Add Part</Button>
+              </div>
+            </div>
+          </Card>
+        </div>
+      )}
+
+      {showEdit && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 overflow-y-auto">
+          <Card title="Edit Part" className="w-full max-w-2xl my-8">
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <Input placeholder="Part Name" value={showEdit.name} onChange={(e: any) => setShowEdit({...showEdit, name: e.target.value})} />
+                <Input placeholder="SKU" value={showEdit.sku} onChange={(e: any) => setShowEdit({...showEdit, sku: e.target.value})} />
+                <Input placeholder="Part Number" value={showEdit.part_number || ''} onChange={(e: any) => setShowEdit({...showEdit, part_number: e.target.value})} />
+                <Input placeholder="Quantity" type="number" value={showEdit.quantity} onChange={(e: any) => setShowEdit({...showEdit, quantity: e.target.value})} />
+                <Select 
+                  options={[
+                    { label: 'Select Team', value: '' },
+                    ...teams.map((t: any) => ({ label: `${t.name} #${t.number}`, value: t.id }))
+                  ]}
+                  value={showEdit.team_id || ''}
+                  onChange={(e: any) => setShowEdit({...showEdit, team_id: e.target.value})}
+                />
+                <Input placeholder="Location" value={showEdit.location || ''} onChange={(e: any) => setShowEdit({...showEdit, location: e.target.value})} />
+                <Input placeholder="Category" value={showEdit.category || ''} onChange={(e: any) => setShowEdit({...showEdit, category: e.target.value})} />
+                <Input placeholder="Cost per Unit" type="number" step="0.01" value={showEdit.cost} onChange={(e: any) => setShowEdit({...showEdit, cost: e.target.value})} />
+                <Select 
+                  options={[
+                    { label: 'Not Assigned', value: '' },
+                    ...members.map((m: any) => ({ label: m.name, value: m.id }))
+                  ]}
+                  value={showEdit.assigned_to || ''}
+                  onChange={(e: any) => setShowEdit({...showEdit, assigned_to: e.target.value})}
+                />
+              </div>
+              <Input placeholder="Description" value={showEdit.description || ''} onChange={(e: any) => setShowEdit({...showEdit, description: e.target.value})} />
+              <div className="flex gap-3 justify-end">
+                <Button variant="secondary" onClick={() => setShowEdit(null)}>Cancel</Button>
+                <Button onClick={handleUpdate}>Save Changes</Button>
+              </div>
+            </div>
+          </Card>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function OutreachView({ outreach, onRefresh }: any) {
   const [showAdd, setShowAdd] = useState(false);
   const [newEvent, setNewEvent] = useState({ title: '', description: '', date: format(new Date(), 'yyyy-MM-dd'), hours: '', location: '' });
@@ -2546,9 +2872,12 @@ function ChatView({ messages, members, currentUser, socket }: any) {
 
   const handleDeleteMessage = async (msgId: number) => {
     try {
-      await fetch(`/api/messages/${msgId}`, {
+      const res = await fetch(`/api/messages/${msgId}`, {
         method: 'DELETE'
       });
+      if (!res.ok) {
+        console.error('Failed to delete message');
+      }
     } catch (error) {
       console.error('Delete error:', error);
     }
@@ -2588,6 +2917,20 @@ function ChatView({ messages, members, currentUser, socket }: any) {
     return /\.(jpg|jpeg|png|gif|webp)$/i.test(filepath);
   };
 
+  const formatFileSize = (bytes: number) => {
+    if (!bytes) return '';
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
+
+  const formatFileDate = (dateString: string) => {
+    if (!dateString) return '';
+    return new Date(dateString).toLocaleDateString() + ' ' + new Date(dateString).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  };
+
   return (
     <div className="flex flex-col h-[calc(100vh-200px)] sm:h-[calc(100vh-180px)] glass rounded-2xl overflow-hidden">
       <div ref={scrollRef} className="flex-1 p-4 sm:p-6 overflow-y-auto space-y-3 sm:space-y-4 custom-scrollbar">
@@ -2615,23 +2958,40 @@ function ChatView({ messages, members, currentUser, socket }: any) {
               </div>
             ) : (
               <div className="flex flex-col gap-2 max-w-[80%]">
-                {msg.file_path && isImageFile(msg.file_path) && (
-                  <img 
-                    src={msg.file_path} 
-                    alt="uploaded" 
-                    className="rounded-lg max-w-xs max-h-64 object-cover"
-                  />
-                )}
-                {msg.file_path && !isImageFile(msg.file_path) && (
-                  <a 
-                    href={msg.file_path}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center gap-2 px-4 py-2 rounded-2xl bg-accent/20 border border-accent/30 hover:bg-accent/30 transition-colors text-sm text-accent"
-                  >
-                    <FileText className="w-4 h-4" />
-                    Download
-                  </a>
+                {msg.file_path && (
+                  <div className="flex flex-col gap-2 mb-1">
+                    {isImageFile(msg.file_path) && (
+                      <img 
+                        src={msg.file_path} 
+                        alt={msg.file_name || "uploaded"} 
+                        className="rounded-lg max-w-xs max-h-64 object-cover border border-white/5 shadow-sm"
+                      />
+                    )}
+                    <div className={cn(
+                      "flex flex-col gap-1 p-3 rounded-2xl border min-w-[200px] max-w-xs",
+                      msg.sender_id === currentUser.id ? "bg-accent/10 border-accent/20" : "bg-white/5 border-white/10"
+                    )}>
+                      <div className="flex items-center gap-2 text-sm font-medium text-white">
+                        <FileText className="w-4 h-4 text-accent shrink-0" />
+                        <span className="truncate">{msg.file_name || msg.file_path.split('/').pop()}</span>
+                      </div>
+                      {(msg.file_size || msg.file_updated) && (
+                        <div className="flex items-center gap-3 text-[10px] text-slate-400">
+                          {msg.file_size && <span>{formatFileSize(msg.file_size)}</span>}
+                          {msg.file_updated && <span>{formatFileDate(msg.file_updated)}</span>}
+                        </div>
+                      )}
+                      <a 
+                        href={msg.file_path}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="mt-2 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg bg-accent/10 border border-accent/20 hover:bg-accent/20 transition-colors text-xs text-accent font-medium"
+                      >
+                        <Download className="w-3 h-3" />
+                        Download
+                      </a>
+                    </div>
+                  </div>
                 )}
                 {msg.content && (
                   <div className={cn(
@@ -2856,7 +3216,91 @@ function SettingsView({ settings, members, onRefresh, currentUser }: any) {
   const [maxTokensSummary, setMaxTokensSummary] = useState(settings.max_tokens_summary || '1024');
   const [showMemberEdit, setShowMemberEdit] = useState<any>(null);
 
+  const [storageUsage, setStorageUsage] = useState<number | null>(null);
+  const [loadingStorage, setLoadingStorage] = useState(false);
+  const [allMessages, setAllMessages] = useState([]);
+  const [loadingMessages, setLoadingMessages] = useState(false);
+  const [editingMessage, setEditingMessage] = useState<any>(null);
+
   const isPresident = currentUser?.role === 'President';
+
+  const fetchStorageUsage = async () => {
+    setLoadingStorage(true);
+    try {
+      const res = await fetch('/api/admin/storage-usage');
+      const data = await res.json();
+      setStorageUsage(data.totalSize);
+    } catch (error) {
+      console.error('Failed to fetch storage usage:', error);
+    } finally {
+      setLoadingStorage(false);
+    }
+  };
+
+  const fetchAllMessages = async () => {
+    setLoadingMessages(true);
+    try {
+      const res = await fetch('/api/messages');
+      const data = await res.json();
+      setAllMessages(data);
+    } catch (error) {
+      console.error('Failed to fetch messages:', error);
+    } finally {
+      setLoadingMessages(false);
+    }
+  };
+
+  const handleSilentDelete = async (messageId: number) => {
+    if (confirm('Are you sure you want to permanently delete this message? This cannot be undone.')) {
+      try {
+        const res = await fetch(`/api/messages/${messageId}?silent=true`, { method: 'DELETE' });
+        if (res.ok) {
+          await fetchAllMessages();
+          alert('Message permanently deleted.');
+        } else {
+          alert('Failed to delete message.');
+        }
+      } catch (error) {
+        console.error('Delete error:', error);
+        alert('Error deleting message: ' + error);
+      }
+    }
+  };
+
+  const handleUpdateMessage = async () => {
+    if (!editingMessage) return;
+    try {
+      const res = await fetch(`/api/messages/${editingMessage.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: editingMessage.content })
+      });
+      if (res.ok) {
+        setEditingMessage(null);
+        await fetchAllMessages();
+        alert('Message updated.');
+      } else {
+        alert('Failed to update message.');
+      }
+    } catch (error) {
+      console.error('Update error:', error);
+      alert('Error updating message: ' + error);
+    }
+  };
+
+  useEffect(() => {
+    fetchStorageUsage();
+    fetchAllMessages();
+  }, []);
+
+  const formatBytes = (bytes: number, decimals = 2) => {
+    if (!bytes || bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+  };
 
   const handleSave = async () => {
     const payloads = [
@@ -2890,6 +3334,53 @@ function SettingsView({ settings, members, onRefresh, currentUser }: any) {
 
   return (
     <div className="max-w-4xl space-y-8">
+      <Card title="Storage Usage" icon={Wallet}>
+        <div className="space-y-4">
+          <p className="text-sm text-slate-400">Total size of all file uploads (messages, code files, etc.).</p>
+          {storageUsage !== null ? (
+            <p className="text-2xl font-bold text-accent">{formatBytes(storageUsage)}</p>
+          ) : (
+            <p className="text-slate-500">Click to calculate.</p>
+          )}
+          <Button onClick={fetchStorageUsage} disabled={loadingStorage}>
+            {loadingStorage ? 'Calculating...' : 'Recalculate'}
+          </Button>
+        </div>
+      </Card>
+      
+      <Card title="Message Management" icon={Mail}>
+        <div className="space-y-4">
+          <p className="text-sm text-slate-400">Silently edit or delete messages.</p>
+          <div className="max-h-96 overflow-y-auto glass p-2 rounded-xl">
+            {loadingMessages ? <p>Loading messages...</p> : (
+              allMessages.map((msg: any) => (
+                <div key={msg.id} className="p-2 border-b border-white/10">
+                  <p className="text-xs text-slate-400">{new Date(msg.timestamp).toLocaleString()} - {msg.sender_name}</p>
+                  {editingMessage?.id === msg.id ? (
+                    <textarea 
+                      value={editingMessage.content} 
+                      onChange={(e) => setEditingMessage({...editingMessage, content: e.target.value})}
+                      className="w-full bg-primary my-1 p-2 rounded"
+                    />
+                  ) : (
+                    <p className="text-sm">{msg.content}</p>
+                  )}
+                  {msg.file_path && <p className="text-xs italic text-accent">{msg.file_path}</p>}
+                  <div className="flex gap-2 mt-2">
+                    {editingMessage?.id === msg.id ? (
+                      <Button onClick={handleUpdateMessage}>Save</Button>
+                    ) : (
+                      <Button onClick={() => setEditingMessage(msg)}>Edit</Button>
+                    )}
+                    <Button onClick={() => handleSilentDelete(msg.id)} variant="danger">Delete</Button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </Card>
+
       <Card title="AI Absence Evaluation" icon={Settings}>
         <div className="space-y-4">
           <p className="text-sm text-slate-400">Define the criteria the AI should use to determine if an absence is excused.</p>
@@ -2983,7 +3474,7 @@ function SettingsView({ settings, members, onRefresh, currentUser }: any) {
           <Card title={`Edit Scopes: ${showMemberEdit.name}`} className="w-full max-w-md">
             <div className="space-y-4">
               <div className="flex flex-wrap gap-2">
-                {['attendance', 'budget', 'tasks', 'admin'].map(s => {
+                {['attendance', 'budget', 'tasks', 'inventory', 'code', 'admin'].map(s => {
                   const currentScopes = (() => {
                     try {
                       const parsed = typeof showMemberEdit.scopes === 'string' ? JSON.parse(showMemberEdit.scopes) : showMemberEdit.scopes;
