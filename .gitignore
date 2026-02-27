@@ -8,4 +8,4 @@ coverage/
 !.env.example
 api.key
 models/*.gguf
-nexus.db
+nexus.dbdashboard.db

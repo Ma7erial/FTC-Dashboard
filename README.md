@@ -2,6 +2,20 @@
 
 A comprehensive club management platform for FIRST Tech Challenge (FTC) teams, featuring real-time attendance tracking, task management, budget oversight, and AI-powered insights.
 
+## Installation
+
+You can install the FTC Dashboard globally via npm:
+
+```bash
+npm install -g ftc-dashboard
+```
+
+Or run it directly using npx:
+
+```bash
+npx ftc-dashboard
+```
+
 ## Features
 
 - **Dashboard**: Live club health metrics, attendance trends, and activity summaries
@@ -30,16 +44,24 @@ A comprehensive club management platform for FIRST Tech Challenge (FTC) teams, f
 
 ## Quick Start
 
+### As a CLI tool
+
+Simply run the dashboard from your terminal:
+
+```bash
+npx ftc-dashboard
+```
+
+This will guide you through the setup on your first run.
+
+### Local Development
+
 1. **Install dependencies:**
    ```bash
    npm install
    ```
 
-2. **Place your model:**
-   - Add a `.gguf` model file to the `models/` directory, or
-   - Set `LLAMA_MODEL_PATH` in `.env` to point to your model location
-
-3. **Start the development server:**
+2. **Start the development server:**
    ```bash
    npm run dev
    ```

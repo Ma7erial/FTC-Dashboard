@@ -1,10 +1,19 @@
+#!/usr/bin/env node
+
 import express from "express";
 import "dotenv/config";
-import { createServer as createViteServer } from "vite";
-import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
+import dotenv from "dotenv";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Load .env from current directory
+dotenv.config();
+
+import { createServer as createViteServer } from "vite";
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
 import bcrypt from "bcryptjs";
@@ -12,6 +21,7 @@ import multer from "multer";
 import { simpleGit, SimpleGit } from "simple-git";
 import axios from "axios";
 import * as cheerio from "cheerio";
+import Database from "better-sqlite3";
 
 // configuration tweaks for temporary behavior
 // set this to true when you want to turn off the news endpoint
@@ -142,10 +152,8 @@ async function callOllama(prompt: string, stream: boolean, onChunk?: (chunk: str
   }
 }
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-let db = new Database("nexus.db");
+const DB_PATH = process.env.DATABASE_URL || path.join(process.cwd(), "dashboard.db");
+let db = new Database(DB_PATH);
 
 // Function to ensure database connection is valid and writable
 function ensureDbConnection() {
@@ -162,7 +170,7 @@ function ensureDbConnection() {
         // Ignore close errors
       }
       // Reconnect
-      db = new Database("nexus.db");
+      db = new Database(DB_PATH);
       return true;
     }
     throw error;
@@ -520,7 +528,7 @@ async function startServer() {
   app.use(express.json());
   
   // Configure multer for file uploads
-  const uploadDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'uploads');
+  const uploadDir = path.join(process.cwd(), 'uploads');
   if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
   }
@@ -562,7 +570,7 @@ async function startServer() {
     console.error("Migration query failed:", err);
   }
   
-  const PORT = 3000;
+  const PORT = parseInt(process.env.PORT || "3000", 10);
 
   // --- WebSocket Logic ---
   const clients = new Set<WebSocket>();
@@ -1589,7 +1597,7 @@ async function startServer() {
 
   // --- Code Management Endpoints ---
   console.log("[Code Manager] Initializing code management endpoints...");
-  const codeRepoDir = path.join(__dirname, "code_repos");
+  const codeRepoDir = path.join(process.cwd(), "code_repos");
   
   if (!fs.existsSync(codeRepoDir)) {
     fs.mkdirSync(codeRepoDir, { recursive: true });

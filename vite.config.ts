@@ -6,6 +6,9 @@ import {defineConfig, loadEnv} from 'vite';
 
 export default defineConfig(({mode}) => {
   // environment variables are no longer needed for the AI client
+  const env = loadEnv(mode, process.cwd(), '');
+  const PORT = env.PORT || '3000';
+
   return {
     plugins: [react(), tailwindcss()],
     resolve: {
@@ -18,11 +21,11 @@ export default defineConfig(({mode}) => {
       allowedHosts: ['firstinspires.junipervirtual.org'],
       proxy: {
         '/api': {
-          target: 'http://localhost:3000',
+          target: `http://localhost:${PORT}`,
           changeOrigin: true,
         },
         '/uploads': {
-          target: 'http://localhost:3000',
+          target: `http://localhost:${PORT}`,
           changeOrigin: true,
         }
       }
