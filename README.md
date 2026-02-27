@@ -1,6 +1,6 @@
 # FTC Dashboard
 
-A comprehensive club management platform for FIRST Tech Challenge (FTC) teams, featuring real-time attendance tracking, task management, budget oversight, and AI-powered insights.
+A comprehensive club management platform for FIRST Tech Challenge (FTC) teams, featuring real-time attendance tracking, task management, budget oversight, and AI-powered insights. Created by teams #10937 and #30548 Stuttgart High School.
 
 ## Installation
 
@@ -50,6 +50,10 @@ Simply run the dashboard from your terminal:
 
 ```bash
 npx ftc-dashboard
+```
+Or, for installation:
+```bash
+npm install ftc-dashboard
 ```
 
 This will guide you through the setup on your first run.
@@ -125,6 +129,5 @@ SQLite database (`nexus.db`) stores:
 - Hot Module Replacement enabled for instant feedback
 
 ## License
-
-Proprietary - FTC Team Dashboard
+MIT
 
