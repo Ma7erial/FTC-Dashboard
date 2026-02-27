@@ -129,5 +129,4 @@ SQLite database (`nexus.db`) stores:
 - Hot Module Replacement enabled for instant feedback
 
 ## License
-MIT
-
+GNU General Public License v3.0
